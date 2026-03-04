@@ -1,0 +1,2 @@
+Sleep 3000
+Send "RUBBER DUCKY TEST - AM I BLOCKED?"
