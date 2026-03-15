@@ -5,8 +5,8 @@ BCryptGenRandom OK
 Trusted keyboards at startup: 4
   [0] handle=0000000000010041 name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
   [1] handle=0000000000010045 name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-  [2] handle=00000000015d0c63 name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-  [3] handle=0000000001ac0c3b name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+  [2] handle=00000000000d06d5 name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+  [3] handle=0000000000b6071f name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 Background window OK
 Raw Input OK
 Device notifications OK
@@ -14,94 +14,127 @@ Keyboard hook OK
 
 >>> Ready - plug in a USB keyboard now <<<
 
-[DC] WM_DEVICECHANGE wParam=32772
-[DC] WM_DEVICECHANGE wParam=32772
-[DC] WM_DEVICECHANGE wParam=32772
-[DC] WM_DEVICECHANGE wParam=32772
-[DC] WM_DEVICECHANGE wParam=32772
-[DC] WM_DEVICECHANGE wParam=32772
-[DC] WM_DEVICECHANGE wParam=32772
 [DC] WM_DEVICECHANGE wParam=32768
 [DC] devicetype=5
-[DC] Enumerated 4 keyboard handle(s)
+[DC] Enumerated 6 keyboard handle(s)
 [DC]   [0] handle=0000000000010041 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC]   [1] handle=0000000000010045 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [2] handle=00000000000c0b6d trusted=1 blocked=0 pending=0
+[DC]   [2] handle=00000000000d06d5 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [3] handle=0000000004fc02bf trusted=1 blocked=0 pending=0
+[DC]   [3] handle=0000000000190a7f trusted=0 blocked=0 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_00#8&300df08&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   -> BLOCKED, will show CAPTCHA
+[DC]   [4] handle=0000000000b6071f trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC] No new device found
+[DC]   [5] handle=000000000e3a05a7 trusted=0 blocked=0 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_03#8&1a43d3a4&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   -> BLOCKED, will show CAPTCHA
+[SHOW] ShowCaptchaForDevice called
+[SHOW] Thread spawned OK
+[THREAD] Started
 [DC] WM_DEVICECHANGE wParam=32768
 [DC] devicetype=5
-[DC] Enumerated 4 keyboard handle(s)
+[THREAD] RegisterClassW OK
+[THREAD] Screen=1920x1080
+[THREAD] Calling CreateWindowExW...
+[CAPTCHA] WM_CREATE - window exists
+[THREAD] Window created OK hwnd=000000000002084a
+[THREAD] Entering message loop
+[DC] Enumerated 6 keyboard handle(s)
 [DC]   [0] handle=0000000000010041 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC]   [1] handle=0000000000010045 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [2] handle=00000000000c0b6d trusted=1 blocked=0 pending=0
+[DC]   [2] handle=00000000000d06d5 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [3] handle=0000000004fc02bf trusted=1 blocked=0 pending=0
+[DC]   [3] handle=0000000000190a7f trusted=0 blocked=1 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_00#8&300df08&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [4] handle=0000000000b6071f trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [5] handle=000000000e3a05a7 trusted=0 blocked=1 pending=1
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_03#8&1a43d3a4&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC] No new device found
 [DC] WM_DEVICECHANGE wParam=32768
 [DC] devicetype=5
-[DC] Enumerated 4 keyboard handle(s)
+[DC] Enumerated 6 keyboard handle(s)
 [DC]   [0] handle=0000000000010041 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC]   [1] handle=0000000000010045 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [2] handle=00000000000c0b6d trusted=1 blocked=0 pending=0
+[DC]   [2] handle=00000000000d06d5 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [3] handle=0000000004fc02bf trusted=1 blocked=0 pending=0
+[DC]   [3] handle=0000000000190a7f trusted=0 blocked=1 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_00#8&300df08&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [4] handle=0000000000b6071f trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [5] handle=000000000e3a05a7 trusted=0 blocked=1 pending=1
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_03#8&1a43d3a4&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC] No new device found
 [DC] WM_DEVICECHANGE wParam=32768
 [DC] devicetype=5
-[DC] Enumerated 4 keyboard handle(s)
+[DC] Enumerated 6 keyboard handle(s)
 [DC]   [0] handle=0000000000010041 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC]   [1] handle=0000000000010045 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [2] handle=00000000000c0b6d trusted=1 blocked=0 pending=0
+[DC]   [2] handle=00000000000d06d5 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [3] handle=0000000004fc02bf trusted=1 blocked=0 pending=0
+[DC]   [3] handle=0000000000190a7f trusted=0 blocked=1 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_00#8&300df08&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [4] handle=0000000000b6071f trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [5] handle=000000000e3a05a7 trusted=0 blocked=1 pending=1
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_03#8&1a43d3a4&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC] No new device found
 [DC] WM_DEVICECHANGE wParam=32768
 [DC] devicetype=5
-[DC] Enumerated 4 keyboard handle(s)
+[DC] Enumerated 6 keyboard handle(s)
 [DC]   [0] handle=0000000000010041 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC]   [1] handle=0000000000010045 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [2] handle=00000000000c0b6d trusted=1 blocked=0 pending=0
+[DC]   [2] handle=00000000000d06d5 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [3] handle=0000000004fc02bf trusted=1 blocked=0 pending=0
+[DC]   [3] handle=0000000000190a7f trusted=0 blocked=1 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_00#8&300df08&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [4] handle=0000000000b6071f trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [5] handle=000000000e3a05a7 trusted=0 blocked=1 pending=1
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_03#8&1a43d3a4&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC] No new device found
 [DC] WM_DEVICECHANGE wParam=32768
 [DC] devicetype=5
-[DC] Enumerated 4 keyboard handle(s)
+[DC] Enumerated 6 keyboard handle(s)
 [DC]   [0] handle=0000000000010041 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC]   [1] handle=0000000000010045 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [2] handle=00000000000c0b6d trusted=1 blocked=0 pending=0
+[DC]   [2] handle=00000000000d06d5 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [3] handle=0000000004fc02bf trusted=1 blocked=0 pending=0
+[DC]   [3] handle=0000000000190a7f trusted=0 blocked=1 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_00#8&300df08&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [4] handle=0000000000b6071f trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [5] handle=000000000e3a05a7 trusted=0 blocked=1 pending=1
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_03#8&1a43d3a4&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC] No new device found
 [DC] WM_DEVICECHANGE wParam=32768
 [DC] devicetype=5
-[DC] Enumerated 4 keyboard handle(s)
+[DC] Enumerated 6 keyboard handle(s)
 [DC]   [0] handle=0000000000010041 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_00#8&14e6f0&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC]   [1] handle=0000000000010045 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_1D57&PID_FA60&MI_03#8&39a53baa&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [2] handle=00000000000c0b6d trusted=1 blocked=0 pending=0
+[DC]   [2] handle=00000000000d06d5 trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_00#8&96ad474&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-[DC]   [3] handle=0000000004fc02bf trusted=1 blocked=0 pending=0
+[DC]   [3] handle=0000000000190a7f trusted=0 blocked=1 pending=0
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_00#8&300df08&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [4] handle=0000000000b6071f trusted=1 blocked=0 pending=0
 [DC]       name=\\?\HID#VID_05AC&PID_024F&MI_01&Col03#8&212e60b9&0&0002#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+[DC]   [5] handle=000000000e3a05a7 trusted=0 blocked=1 pending=1
+[DC]       name=\\?\HID#VID_1D57&PID_FA55&MI_03#8&1a43d3a4&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 [DC] No new device found
+[CAPTCHA] OK clicked
+[THREAD] Loop exited

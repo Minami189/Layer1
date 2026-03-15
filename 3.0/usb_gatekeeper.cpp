@@ -1,14 +1,9 @@
 /*
- * USB Gatekeeper — BadUSB Interceptor with Cryptographic CAPTCHA
+ * USB Gatekeeper — BadUSB Interceptor
  *
- * CAPTCHA SECURITY MODEL:
- *   - All randomness comes from BCryptGenRandom (Windows CSPRNG)
- *   - Three challenge types: Word Scramble, Hex Decode, Token Echo
- *   - 3 wrong answers = permanent block for the session
- *
- * BUILD (MSYS2 UCRT64 terminal — run as Admin):
+ * BUILD (MSYS2 UCRT64, run as Admin):
  *   g++ -std=c++17 -o usb_gatekeeper.exe usb_gatekeeper.cpp \
- *       -luser32 -lgdi32 -lhid -lsetupapi -lcomctl32 -lbcrypt -mwindows
+ *       -luser32 -lgdi32 -lhid -lsetupapi -lbcrypt -mwindows
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -17,570 +12,668 @@
 
 #include <windows.h>
 #include <bcrypt.h>
-#include <commctrl.h>
 #include <dbt.h>
 #include <hidusage.h>
 #include <iostream>
+#include <sstream>
+#include <iomanip>
 #include <vector>
 #include <set>
 #include <string>
 #include <mutex>
-#include <algorithm>
-#include <sstream>
-#include <iomanip>
+#include <atomic>
+#include <cmath>
 
-#pragma comment(lib, "bcrypt.lib")
-
-#define IDC_CAPTCHA_LABEL    101
-#define IDC_CAPTCHA_SUBLABEL 102
-#define IDC_CAPTCHA_INPUT    103
-#define IDC_CAPTCHA_SUBMIT   104
-#define IDC_CAPTCHA_DENY     105
+#define IDC_LABEL    101
+#define IDC_SUBLABEL 102
+#define IDC_INPUT    103
+#define IDC_SUBMIT   104
+#define IDC_DENY     105
+#define IDC_T1 201
+#define IDC_T2 202
+#define IDC_T3 203
+#define IDC_T4 204
+#define IDC_T5 205
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BCrypt helpers
+// BCrypt
 // ─────────────────────────────────────────────────────────────────────────────
 bool CryptoRandomBytes(void* buf, size_t len)
 {
-    return BCRYPT_SUCCESS(
-        BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)len,
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG));
+    return BCRYPT_SUCCESS(BCryptGenRandom(NULL,(PUCHAR)buf,(ULONG)len,
+                          BCRYPT_USE_SYSTEM_PREFERRED_RNG));
 }
-
-DWORD CryptoRandRange(DWORD upperBound)
+DWORD CryptoRandRange(DWORD upper)
 {
-    if (upperBound <= 1) return 0;
-    DWORD result = 0;
-    DWORD threshold = (0xFFFFFFFFu % upperBound);
-    do { CryptoRandomBytes(&result, sizeof(result)); } while (result < threshold);
-    return result % upperBound;
+    if(upper<=1) return 0;
+    DWORD r=0, t=0xFFFFFFFFu%upper;
+    do{ CryptoRandomBytes(&r,sizeof(r)); } while(r<t);
+    return r%upper;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CAPTCHA generation
+// Challenge
 // ─────────────────────────────────────────────────────────────────────────────
-enum class CaptchaType { WordScramble, HexDecode, TokenEcho };
-struct Captcha { CaptchaType type; std::wstring prompt; std::wstring answer; };
+enum class ChalType { Scramble, Hex, Token, MouseColor };
+enum class DevClass  { Keyboard, Mouse, Unknown };
 
-static const wchar_t* WORD_POOL[] = {
-    L"PLANET", L"BRIDGE", L"FALCON", L"SPIDER", L"WINTER",
-    L"GARDEN", L"MIRROR", L"CASTLE", L"DRAGON", L"SILVER",
-    L"FOREST", L"ROCKET", L"MARBLE", L"HUNTER", L"COBALT",
-    L"STRIKE", L"VECTOR", L"TURRET", L"CANYON", L"PRISM"
+struct Challenge {
+    ChalType     type;
+    std::wstring display, hint, answer;
+    int          colorIdx=0, targetBox=0, boxColors[5]={};
 };
-static const int WORD_POOL_SIZE = 20;
 
-std::wstring ScrambleWord(const std::wstring& word)
+static const wchar_t* WORDS[]=
+{L"PLANET",L"BRIDGE",L"FALCON",L"SPIDER",L"WINTER",L"GARDEN",L"MIRROR",
+ L"CASTLE",L"DRAGON",L"SILVER",L"FOREST",L"ROCKET",L"MARBLE",L"HUNTER",
+ L"COBALT",L"STRIKE",L"VECTOR",L"TURRET",L"CANYON",L"PRISM"};
+static const wchar_t* CNAMES[]=
+{L"RED",L"GREEN",L"BLUE",L"YELLOW",L"ORANGE"};
+static const COLORREF CVALS[]=
+{RGB(210,45,45),RGB(45,170,45),RGB(45,90,210),RGB(210,190,0),RGB(210,110,0)};
+
+std::wstring ScrambleWord(const std::wstring& w)
 {
-    std::wstring s = word;
-    int attempts = 0;
-    do {
-        for (int i = (int)s.size() - 1; i > 0; --i)
-            std::swap(s[i], s[CryptoRandRange((DWORD)(i + 1))]);
-        attempts++;
-    } while (s == word && attempts < 20);
+    std::wstring s=w; int t=0;
+    do{ for(int i=(int)s.size()-1;i>0;--i)
+            std::swap(s[i],s[CryptoRandRange(i+1)]); }
+    while(s==w && ++t<20);
     return s;
 }
-
 std::wstring SpaceLetters(const std::wstring& w)
 {
-    std::wstring out;
-    for (size_t i = 0; i < w.size(); ++i) { if (i) out += L' '; out += w[i]; }
-    return out;
+    std::wstring o;
+    for(size_t i=0;i<w.size();++i){ if(i)o+=L' '; o+=w[i]; }
+    return o;
 }
-
-std::wstring GenerateToken()
+std::wstring MakeToken()
 {
-    const wchar_t LETTERS[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ";
-    const wchar_t DIGITS[]  = L"23456789";
-    std::wstring token;
-    for (int group = 0; group < 3; ++group) {
-        if (group) token += L'-';
-        token += LETTERS[CryptoRandRange((DWORD)(wcslen(LETTERS)))];
-        token += DIGITS[CryptoRandRange((DWORD)(wcslen(DIGITS)))];
+    const wchar_t L2[]=L"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const wchar_t D2[]=L"23456789";
+    std::wstring t;
+    for(int g=0;g<3;++g){
+        if(g)t+=L'-';
+        t+=L2[CryptoRandRange((DWORD)wcslen(L2))];
+        t+=D2[CryptoRandRange((DWORD)wcslen(D2))];
     }
-    return token;
+    return t;
 }
-
-Captcha GenerateCaptcha()
+Challenge GenKBChallenge()
 {
-    Captcha c;
-    c.type = static_cast<CaptchaType>(CryptoRandRange(3));
-    switch (c.type)
-    {
-    case CaptchaType::WordScramble: {
-        std::wstring word = WORD_POOL[CryptoRandRange(WORD_POOL_SIZE)];
-        c.prompt = L"Unscramble these letters into a word:\n\n" + SpaceLetters(ScrambleWord(word));
-        c.answer = word;
-        break;
+    Challenge c; c.type=(ChalType)CryptoRandRange(3);
+    switch(c.type){
+    case ChalType::Scramble:{
+        std::wstring w=WORDS[CryptoRandRange(20)];
+        c.display=SpaceLetters(ScrambleWord(w));
+        c.hint=L"Unscramble into a word"; c.answer=w; break;
     }
-    case CaptchaType::HexDecode: {
-        BYTE code = (BYTE)(0x41 + CryptoRandRange(26));
-        std::wostringstream oss;
-        oss << L"What letter does hex value  0x"
-            << std::uppercase << std::hex << std::setw(2) << std::setfill(L'0')
-            << (int)code << L"  represent?\n(Type the single letter)";
-        c.prompt = oss.str();
-        c.answer = std::wstring(1, (wchar_t)code);
-        break;
+    case ChalType::Hex:{
+        BYTE code=(BYTE)(0x41+CryptoRandRange(26));
+        std::wostringstream ss;
+        ss<<L"0x"<<std::uppercase<<std::hex
+          <<std::setw(2)<<std::setfill(L'0')<<(int)code;
+        c.display=ss.str();
+        c.hint=L"Type the letter this hex value represents";
+        c.answer=std::wstring(1,(wchar_t)code); break;
     }
-    case CaptchaType::TokenEcho: {
-        std::wstring token = GenerateToken();
-        c.prompt = L"Type this security code exactly as shown:\n\n" + token;
-        c.answer = token;
-        break;
+    case ChalType::Token:{
+        std::wstring tok=MakeToken();
+        c.display=tok; c.hint=L"Type this code exactly";
+        c.answer=tok; break;
     }
+    default: break;
     }
     return c;
 }
-
-bool WStrEqualCI(const std::wstring& a, const std::wstring& b)
+Challenge GenMouseChallenge()
 {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i)
-        if (towupper(a[i]) != towupper(b[i])) return false;
+    Challenge c; c.type=ChalType::MouseColor;
+    c.colorIdx=(int)CryptoRandRange(5);
+    int perm[5]={0,1,2,3,4};
+    for(int i=4;i>0;--i) std::swap(perm[i],perm[CryptoRandRange(i+1)]);
+    for(int i=0;i<5;i++) c.boxColors[i]=perm[i];
+    for(int i=0;i<5;i++) if(c.boxColors[i]==c.colorIdx){ c.targetBox=i; break; }
+    c.display=std::wstring(L"Click the ")+CNAMES[c.colorIdx]+L" box";
+    return c;
+}
+bool WEqCI(const std::wstring& a, const std::wstring& b)
+{
+    if(a.size()!=b.size()) return false;
+    for(size_t i=0;i<a.size();++i)
+        if(towupper(a[i])!=towupper(b[i])) return false;
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Timing analyzer
+// ─────────────────────────────────────────────────────────────────────────────
+struct Timing {
+    std::vector<double> ts;
+    void Add(double t){ ts.push_back(t); }
+    void Reset(){ ts.clear(); }
+    bool IsHuman() const {
+        if(ts.size()<4) return true;
+        std::vector<double> gaps;
+        for(size_t i=1;i<ts.size();++i) gaps.push_back(ts[i]-ts[i-1]);
+        double mean=0; for(double g:gaps) mean+=g; mean/=gaps.size();
+        double var=0;  for(double g:gaps) var+=(g-mean)*(g-mean); var/=gaps.size();
+        return !(mean<50.0 && std::sqrt(var)<20.0);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Globals
 // ─────────────────────────────────────────────────────────────────────────────
-std::set<HANDLE>       g_trustedDevices;
-std::set<std::wstring> g_trustedNames;
-std::set<HANDLE>       g_blockedDevices;
-std::set<HANDLE>       g_pendingDevices;
-std::mutex             g_deviceMutex;
+std::set<HANDLE>        g_trusted;
+std::set<std::wstring>  g_trustedNames;
+std::set<std::wstring>  g_trustedVIDs;
+std::set<HANDLE>        g_blocked;
+std::set<HANDLE>        g_pending;
+std::set<std::wstring>  g_deniedNames;  // permanently blocked by name
+std::set<std::wstring>  g_deniedVIDs;   // permanently blocked by VID
+std::mutex              g_devMutex;
 
-static HANDLE          g_lastRawDevice = NULL;
+static HANDLE            g_lastRawDevice = NULL;
+static bool              g_rawReady      = false;
+static std::atomic<bool> g_captchaActive{false};
 
-HHOOK                  g_kbHook     = NULL;
-HWND                   g_hWnd       = NULL;
-HWND                   g_hCaptcha   = NULL;
-HDEVNOTIFY             g_hDevNotify = NULL;
+HHOOK      g_kbHook     = NULL;
+HWND       g_hWnd       = NULL;
+HWND       g_hCaptcha   = NULL;
+HDEVNOTIFY g_hDevNotify = NULL;
 
-static Captcha         g_currentCaptcha;
-static HANDLE          g_captchaDevice = NULL;
-static int             g_wrongAttempts = 0;
-static const int       MAX_WRONG       = 3;
+static Challenge  g_chal;
+static HANDLE     g_chalDev = NULL;
+static DevClass   g_chalDC  = DevClass::Unknown;
+static int        g_wrong   = 0;
+static const int  MAX_WRONG = 3;
+static Timing     g_timing;
+static HWND       g_mouseBoxHwnd[5]={};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Device helpers
 // ─────────────────────────────────────────────────────────────────────────────
-std::set<HANDLE> EnumerateKeyboardDevices()
+std::wstring GetDevName(HANDLE h)
 {
-    std::set<HANDLE> out;
-    UINT n = 0;
-    GetRawInputDeviceList(NULL, &n, sizeof(RAWINPUTDEVICELIST));
-    if (!n) return out;
-    std::vector<RAWINPUTDEVICELIST> list(n);
-    if (GetRawInputDeviceList(list.data(), &n, sizeof(RAWINPUTDEVICELIST)) == (UINT)-1)
-        return out;
-    for (auto& d : list)
-        if (d.dwType == RIM_TYPEKEYBOARD)
-            out.insert(d.hDevice);
-    return out;
-}
-
-std::wstring GetDeviceName(HANDLE h)
-{
-    UINT sz = 0;
-    GetRawInputDeviceInfoW(h, RIDI_DEVICENAME, NULL, &sz);
-    if (!sz) return L"<unknown>";
-    std::wstring s(sz, L'\0');
-    GetRawInputDeviceInfoW(h, RIDI_DEVICENAME, s.data(), &sz);
+    UINT sz=0;
+    GetRawInputDeviceInfoW(h,RIDI_DEVICENAME,NULL,&sz);
+    if(!sz) return L"<unknown>";
+    std::wstring s(sz,L'\0');
+    GetRawInputDeviceInfoW(h,RIDI_DEVICENAME,s.data(),&sz);
     return s;
 }
-
+std::wstring GetVID(const std::wstring& name)
+{
+    auto p=name.find(L"VID_");
+    if(p==std::wstring::npos) return L"";
+    return name.substr(p,8);
+}
 std::wstring ShortName(HANDLE h)
 {
-    std::wstring full = GetDeviceName(h);
-    auto p = full.find(L"VID_");
-    if (p != std::wstring::npos && full.size() > p + 16)
-        return full.substr(p, 16);
-    return full.size() > 40 ? full.substr(0, 40) + L"..." : full;
+    std::wstring f=GetDevName(h);
+    auto p=f.find(L"VID_");
+    if(p!=std::wstring::npos && f.size()>p+16) return f.substr(p,16);
+    return f.size()>40 ? f.substr(0,40)+L"..." : f;
 }
-
-bool IsTrustedDevice(HANDLE h)
+std::set<HANDLE> EnumByType(DWORD type)
 {
-    if (g_trustedDevices.count(h)) return true;
-    return g_trustedNames.count(GetDeviceName(h)) > 0;
+    std::set<HANDLE> out; UINT n=0;
+    GetRawInputDeviceList(NULL,&n,sizeof(RAWINPUTDEVICELIST));
+    if(!n) return out;
+    std::vector<RAWINPUTDEVICELIST> list(n);
+    if(GetRawInputDeviceList(list.data(),&n,sizeof(RAWINPUTDEVICELIST))==(UINT)-1) return out;
+    for(auto& d:list) if(d.dwType==type) out.insert(d.hDevice);
+    return out;
+}
+bool IsTrusted(HANDLE h)
+{
+    if(g_trusted.count(h)) return true;
+    std::wstring n=GetDevName(h);
+    if(g_trustedNames.count(n)) return true;
+    std::wstring vid=GetVID(n);
+    return !vid.empty() && g_trustedVIDs.count(vid);
+}
+void TrustDev(HANDLE h)
+{
+    std::wstring n=GetDevName(h), vid=GetVID(n);
+    g_trusted.insert(h);
+    g_trustedNames.insert(n);
+    if(!vid.empty()) g_trustedVIDs.insert(vid);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CAPTCHA Window Procedure  (unchanged from working version)
+// Approve / Deny
+// ─────────────────────────────────────────────────────────────────────────────
+void ApproveDevice(HANDLE dev)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_devMutex);
+        // Trust by name+VID first so IsTrusted() returns true for all sibling handles
+        TrustDev(dev);
+        // Remove ALL handles from g_blocked that are now trusted (covers MI_00 + MI_03)
+        for(auto it=g_blocked.begin();it!=g_blocked.end();)
+            it=IsTrusted(*it)?g_blocked.erase(it):++it;
+        for(auto it=g_pending.begin();it!=g_pending.end();)
+            it=IsTrusted(*it)?g_pending.erase(it):++it;
+        g_lastRawDevice=NULL; // force fresh WM_INPUT read
+    }
+    std::wcout<<L"[APPROVED] "<<ShortName(dev)<<L"\n";
+    g_chalDev=NULL; g_hCaptcha=NULL; g_captchaActive=false;
+}
+void DenyDevice(HANDLE dev)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_devMutex);
+        g_pending.erase(dev);
+        // stays in g_blocked for this session
+        // Record name+VID so replug is also permanently blocked
+        std::wstring n=GetDevName(dev), vid=GetVID(n);
+        g_deniedNames.insert(n);
+        if(!vid.empty()) g_deniedVIDs.insert(vid);
+    }
+    std::wcout<<L"[DENIED] "<<ShortName(dev)<<L"\n";
+    g_chalDev=NULL; g_hCaptcha=NULL; g_captchaActive=false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Win32 CAPTCHA window
 // ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
-    static HBRUSH hBgBrush  = NULL;
-    static HFONT  hFontBig  = NULL;
-    static HFONT  hFontMono = NULL;
+    static HBRUSH hBg=NULL, hEdit=NULL;
+    static HFONT  hFB=NULL, hFM=NULL;
+    static HBRUSH hBox[5]={};
 
-    auto Cleanup = [&]() {
-        if (hBgBrush)  { DeleteObject(hBgBrush);  hBgBrush  = NULL; }
-        if (hFontBig)  { DeleteObject(hFontBig);  hFontBig  = NULL; }
-        if (hFontMono) { DeleteObject(hFontMono); hFontMono = NULL; }
+    auto Cleanup=[&](){
+        if(hBg)  {DeleteObject(hBg);  hBg=NULL;}
+        if(hEdit){DeleteObject(hEdit);hEdit=NULL;}
+        if(hFB)  {DeleteObject(hFB);  hFB=NULL;}
+        if(hFM)  {DeleteObject(hFM);  hFM=NULL;}
+        for(auto& b:hBox)if(b){DeleteObject(b);b=NULL;}
     };
 
-    switch (msg)
-    {
-    case WM_CREATE:
-    {
-        hBgBrush  = CreateSolidBrush(RGB(22, 27, 48));
-        hFontBig  = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        hFontMono = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+    switch(msg){
+    case WM_CREATE:{
+        hBg  = CreateSolidBrush(RGB(18,22,40));
+        hEdit= CreateSolidBrush(RGB(30,35,60));
+        hFB  = CreateFontW(18,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+                           CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+        hFM  = CreateFontW(17,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+                           CLEARTYPE_QUALITY,FIXED_PITCH,L"Consolas");
 
-        HWND hI = CreateWindowExW(0, L"STATIC", NULL, WS_CHILD|WS_VISIBLE|SS_ICON,
-            16, 14, 36, 36, hw, (HMENU)200, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hI, STM_SETICON, (WPARAM)LoadIconW(NULL, IDI_WARNING), 0);
+        // Icon + title
+        HWND hIcon=CreateWindowExW(0,L"STATIC",NULL,WS_CHILD|WS_VISIBLE|SS_ICON,
+            16,14,32,32,hw,(HMENU)200,GetModuleHandleW(NULL),NULL);
+        SendMessageW(hIcon,STM_SETICON,(WPARAM)LoadIconW(NULL,IDI_WARNING),0);
 
-        HWND hHdr = CreateWindowExW(0, L"STATIC", L"New USB Keyboard — Access Blocked",
-            WS_CHILD|WS_VISIBLE|SS_LEFT, 60, 14, 420, 24,
-            hw, (HMENU)201, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hHdr, WM_SETFONT, (WPARAM)hFontBig, TRUE);
+        std::wstring title = (g_chalDC==DevClass::Mouse)
+            ? L"New USB Mouse Detected — Security Challenge"
+            : L"New USB Keyboard Detected — Security Challenge";
+        HWND hTitle=CreateWindowExW(0,L"STATIC",title.c_str(),
+            WS_CHILD|WS_VISIBLE|SS_LEFT,56,16,440,22,
+            hw,(HMENU)201,GetModuleHandleW(NULL),NULL);
+        SendMessageW(hTitle,WM_SETFONT,(WPARAM)hFB,TRUE);
 
-        CreateWindowExW(0, L"STATIC",
-            L"Solve the challenge on your TRUSTED keyboard to approve this device.",
-            WS_CHILD|WS_VISIBLE|SS_LEFT, 60, 40, 420, 18,
-            hw, (HMENU)202, GetModuleHandleW(NULL), NULL);
+        // Divider
+        CreateWindowExW(0,L"STATIC",NULL,WS_CHILD|WS_VISIBLE|SS_ETCHEDHORZ,
+            12,50,480,2,hw,(HMENU)202,GetModuleHandleW(NULL),NULL);
 
-        CreateWindowExW(0, L"STATIC", NULL, WS_CHILD|WS_VISIBLE|SS_ETCHEDHORZ,
-            12, 66, 468, 2, hw, (HMENU)203, GetModuleHandleW(NULL), NULL);
-
-        HWND hLbl = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD|WS_VISIBLE|SS_CENTER, 12, 76, 468, 64,
-            hw, (HMENU)IDC_CAPTCHA_LABEL, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFontBig, TRUE);
-
-        CreateWindowExW(0, L"STATIC", L"", WS_CHILD|WS_VISIBLE|SS_CENTER,
-            12, 146, 468, 18, hw,
-            (HMENU)IDC_CAPTCHA_SUBLABEL, GetModuleHandleW(NULL), NULL);
-
-        HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD|WS_VISIBLE|ES_CENTER|ES_AUTOHSCROLL,
-            150, 172, 192, 28, hw,
-            (HMENU)IDC_CAPTCHA_INPUT, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hEdit, WM_SETFONT, (WPARAM)hFontMono, TRUE);
-
-        HWND hApp = CreateWindowExW(0, L"BUTTON", L"Approve",
-            WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 110, 214, 110, 32,
-            hw, (HMENU)IDC_CAPTCHA_SUBMIT, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hApp, WM_SETFONT, (WPARAM)hFontBig, TRUE);
-
-        HWND hDny = CreateWindowExW(0, L"BUTTON", L"Deny",
-            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 272, 214, 110, 32,
-            hw, (HMENU)IDC_CAPTCHA_DENY, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hDny, WM_SETFONT, (WPARAM)hFontBig, TRUE);
-
-        g_currentCaptcha = GenerateCaptcha();
-        g_wrongAttempts  = 0;
-        SetDlgItemTextW(hw, IDC_CAPTCHA_LABEL,    g_currentCaptcha.prompt.c_str());
-        SetDlgItemTextW(hw, IDC_CAPTCHA_SUBLABEL, L"Attempts remaining: 3");
-        SetFocus(GetDlgItem(hw, IDC_CAPTCHA_INPUT));
+        if(g_chalDC==DevClass::Mouse){
+            // Prompt
+            HWND hP=CreateWindowExW(0,L"STATIC",g_chal.display.c_str(),
+                WS_CHILD|WS_VISIBLE|SS_CENTER,12,60,480,28,
+                hw,(HMENU)IDC_LABEL,GetModuleHandleW(NULL),NULL);
+            SendMessageW(hP,WM_SETFONT,(WPARAM)hFB,TRUE);
+            // Attempts
+            CreateWindowExW(0,L"STATIC",L"3 attempts remaining",
+                WS_CHILD|WS_VISIBLE|SS_CENTER,12,90,480,18,
+                hw,(HMENU)IDC_SUBLABEL,GetModuleHandleW(NULL),NULL);
+            // Color boxes
+            for(int i=0;i<5;i++){
+                int ci=g_chal.boxColors[i];
+                hBox[i]=CreateSolidBrush(CVALS[ci]);
+                g_mouseBoxHwnd[i]=CreateWindowExW(WS_EX_CLIENTEDGE,L"BUTTON",
+                    CNAMES[ci],WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+                    12+i*92,116,86,62,hw,(HMENU)(UINT_PTR)(IDC_T1+i),
+                    GetModuleHandleW(NULL),NULL);
+            }
+            CreateWindowExW(0,L"BUTTON",L"Deny Access",
+                WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+                185,194,120,30,hw,(HMENU)IDC_DENY,GetModuleHandleW(NULL),NULL);
+        } else {
+            // Challenge display
+            HWND hDisp=CreateWindowExW(0,L"STATIC",g_chal.display.c_str(),
+                WS_CHILD|WS_VISIBLE|SS_CENTER,12,60,480,52,
+                hw,(HMENU)IDC_LABEL,GetModuleHandleW(NULL),NULL);
+            SendMessageW(hDisp,WM_SETFONT,(WPARAM)hFB,TRUE);
+            // Hint
+            CreateWindowExW(0,L"STATIC",g_chal.hint.c_str(),
+                WS_CHILD|WS_VISIBLE|SS_CENTER,12,116,480,18,
+                hw,(HMENU)IDC_SUBLABEL,GetModuleHandleW(NULL),NULL);
+            // Input
+            HWND hE=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
+                WS_CHILD|WS_VISIBLE|ES_CENTER|ES_AUTOHSCROLL,
+                148,142,196,28,hw,(HMENU)IDC_INPUT,GetModuleHandleW(NULL),NULL);
+            SendMessageW(hE,WM_SETFONT,(WPARAM)hFM,TRUE);
+            // Buttons
+            HWND hSub=CreateWindowExW(0,L"BUTTON",L"Submit",
+                WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
+                108,182,114,32,hw,(HMENU)IDC_SUBMIT,GetModuleHandleW(NULL),NULL);
+            SendMessageW(hSub,WM_SETFONT,(WPARAM)hFB,TRUE);
+            CreateWindowExW(0,L"BUTTON",L"Deny Access",
+                WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+                270,182,114,32,hw,(HMENU)IDC_DENY,GetModuleHandleW(NULL),NULL);
+            SetFocus(GetDlgItem(hw,IDC_INPUT));
+        }
+        g_wrong=0; g_timing.Reset();
         return 0;
     }
 
-    case WM_ERASEBKGND: {
-        RECT rc; GetClientRect(hw, &rc);
-        FillRect((HDC)wp, &rc, hBgBrush);
-        return 1;
-    }
+    case WM_COMMAND:{
+        int id=LOWORD(wp);
 
-    case WM_CTLCOLORSTATIC: {
-        SetBkMode((HDC)wp, TRANSPARENT);
-        SetTextColor((HDC)wp, RGB(210, 220, 255));
-        return (LRESULT)hBgBrush;
-    }
+        // ── Submit keyboard answer ──────────────────────────────────────────
+        if(id==IDC_SUBMIT || id==IDOK){
+            wchar_t buf[128]={}; GetDlgItemTextW(hw,IDC_INPUT,buf,127);
+            std::wstring input(buf);
+            auto b=input.find_first_not_of(L" \t");
+            auto e=input.find_last_not_of(L" \t");
+            input=(b==std::wstring::npos)?L"":input.substr(b,e-b+1);
 
-    case WM_CTLCOLOREDIT: {
-        SetBkColor((HDC)wp, RGB(36, 41, 66));
-        SetTextColor((HDC)wp, RGB(230, 240, 255));
-        static HBRUSH hEditBrush = CreateSolidBrush(RGB(36, 41, 66));
-        return (LRESULT)hEditBrush;
-    }
-
-    case WM_COMMAND:
-    {
-        int id = LOWORD(wp);
-
-        if (id == IDC_CAPTCHA_SUBMIT || id == IDOK)
-        {
-            wchar_t buf[64] = {};
-            GetDlgItemTextW(hw, IDC_CAPTCHA_INPUT, buf, 63);
-            std::wstring userInput(buf);
-            // trim
-            auto b = userInput.find_first_not_of(L" \t\r\n");
-            auto e = userInput.find_last_not_of(L" \t\r\n");
-            userInput = (b == std::wstring::npos) ? L"" : userInput.substr(b, e - b + 1);
-
-            if (WStrEqualCI(userInput, g_currentCaptcha.answer))
-            {
-                HANDLE approvedDevice = g_captchaDevice;
-                {
-                    std::lock_guard<std::mutex> lk(g_deviceMutex);
-                    g_blockedDevices.erase(approvedDevice);
-                    g_pendingDevices.erase(approvedDevice);
-                    g_trustedDevices.insert(approvedDevice);
-                    g_trustedNames.insert(GetDeviceName(approvedDevice));
-                }
-                std::wcout << L"[CAPTCHA PASSED] Device trusted: "
-                           << ShortName(approvedDevice) << L"\n";
-                g_captchaDevice = NULL;
-                g_hCaptcha      = NULL;
-                Cleanup();
-                DestroyWindow(hw);
-                // Signal the captcha thread's message loop to exit
-                PostQuitMessage(0);
+            // Robotic check
+            if(!g_timing.IsHuman()){
+                g_wrong++; g_timing.Reset(); MessageBeep(MB_ICONEXCLAMATION);
+                if(g_wrong>=MAX_WRONG) goto deny;
+                SetDlgItemTextW(hw,IDC_SUBLABEL,
+                    (L"Robotic input detected! "+std::to_wstring(MAX_WRONG-g_wrong)+L" attempt(s) left").c_str());
+                g_chal=GenKBChallenge();
+                SetDlgItemTextW(hw,IDC_LABEL,g_chal.display.c_str());
+                SetDlgItemTextW(hw,IDC_INPUT,L"");
+                SetFocus(GetDlgItem(hw,IDC_INPUT));
+                return 0;
             }
-            else
-            {
-                g_wrongAttempts++;
-                MessageBeep(MB_ICONEXCLAMATION);
-                if (g_wrongAttempts >= MAX_WRONG)
-                {
-                    std::wcout << L"[CAPTCHA LOCKOUT] Permanently blocked: "
-                               << ShortName(g_captchaDevice) << L"\n";
-                    {
-                        std::lock_guard<std::mutex> lk(g_deviceMutex);
-                        g_pendingDevices.erase(g_captchaDevice);
-                    }
-                    MessageBoxW(hw,
-                        L"Maximum attempts exceeded.\nDevice permanently blocked.",
-                        L"USB Gatekeeper — Locked",
-                        MB_OK|MB_ICONERROR|MB_TOPMOST);
-                    g_captchaDevice = NULL;
-                    g_hCaptcha      = NULL;
-                    Cleanup();
-                    DestroyWindow(hw);
-                    PostQuitMessage(0);
+
+            if(WEqCI(input,g_chal.answer)){
+                ApproveDevice(g_chalDev);
+                Cleanup(); DestroyWindow(hw); PostQuitMessage(0);
+            } else {
+                g_wrong++; g_timing.Reset(); MessageBeep(MB_ICONEXCLAMATION);
+                if(g_wrong>=MAX_WRONG){
+                    MessageBoxW(hw,L"Maximum attempts exceeded. Device blocked.",
+                        L"Blocked",MB_OK|MB_ICONERROR|MB_TOPMOST);
+                    goto deny;
                 }
-                else
-                {
-                    int rem = MAX_WRONG - g_wrongAttempts;
-                    SetDlgItemTextW(hw, IDC_CAPTCHA_SUBLABEL,
-                        (L"Wrong!  Attempts remaining: " + std::to_wstring(rem)).c_str());
-                    g_currentCaptcha = GenerateCaptcha();
-                    SetDlgItemTextW(hw, IDC_CAPTCHA_LABEL, g_currentCaptcha.prompt.c_str());
-                    SetDlgItemTextW(hw, IDC_CAPTCHA_INPUT, L"");
-                    SetFocus(GetDlgItem(hw, IDC_CAPTCHA_INPUT));
-                    std::wcout << L"[CAPTCHA FAILED] Wrong answer ("
-                               << g_wrongAttempts << L"/" << MAX_WRONG << L")\n";
+                SetDlgItemTextW(hw,IDC_SUBLABEL,
+                    (L"Wrong answer. "+std::to_wstring(MAX_WRONG-g_wrong)+L" attempt(s) left").c_str());
+                g_chal=GenKBChallenge();
+                SetDlgItemTextW(hw,IDC_LABEL,g_chal.display.c_str());
+                SetDlgItemTextW(hw,IDC_INPUT,L"");
+                SetFocus(GetDlgItem(hw,IDC_INPUT));
+            }
+            return 0;
+        }
+
+        // ── Mouse box click ─────────────────────────────────────────────────
+        if(id>=IDC_T1 && id<=IDC_T5){
+            int clicked=id-IDC_T1;
+            if(clicked==g_chal.targetBox){
+                ApproveDevice(g_chalDev);
+                Cleanup(); DestroyWindow(hw); PostQuitMessage(0);
+            } else {
+                g_wrong++; MessageBeep(MB_ICONEXCLAMATION);
+                if(g_wrong>=MAX_WRONG) goto deny;
+                SetDlgItemTextW(hw,IDC_SUBLABEL,
+                    (L"Wrong box. "+std::to_wstring(MAX_WRONG-g_wrong)+L" attempt(s) left").c_str());
+                g_chal=GenMouseChallenge();
+                SetDlgItemTextW(hw,IDC_LABEL,g_chal.display.c_str());
+                for(int i=0;i<5;i++){
+                    int ci=g_chal.boxColors[i];
+                    SetWindowTextW(g_mouseBoxHwnd[i],CNAMES[ci]);
+                    if(hBox[i]) DeleteObject(hBox[i]);
+                    hBox[i]=CreateSolidBrush(CVALS[ci]);
+                    InvalidateRect(g_mouseBoxHwnd[i],NULL,TRUE);
                 }
             }
             return 0;
         }
 
-        if (id == IDC_CAPTCHA_DENY || id == IDCANCEL)
-        {
-            std::wcout << L"[CAPTCHA DENIED] Stays blocked: "
-                       << ShortName(g_captchaDevice) << L"\n";
-            {
-                std::lock_guard<std::mutex> lk(g_deviceMutex);
-                g_pendingDevices.erase(g_captchaDevice);
-            }
-            g_captchaDevice = NULL;
-            g_hCaptcha      = NULL;
-            Cleanup();
-            DestroyWindow(hw);
-            PostQuitMessage(0);
+        // ── Deny ────────────────────────────────────────────────────────────
+        if(id==IDC_DENY || id==IDCANCEL){
+            deny:
+            DenyDevice(g_chalDev);
+            Cleanup(); DestroyWindow(hw); PostQuitMessage(0);
             return 0;
         }
         return 0;
     }
 
+    // Key timing — record timestamps as user types
+    case WM_KEYDOWN:{
+        if((HWND)GetFocus()==GetDlgItem(hw,IDC_INPUT))
+            g_timing.Add((double)GetTickCount64());
+        return DefWindowProcW(hw,msg,wp,lp);
+    }
+
+    case WM_CTLCOLORBTN:{
+        HWND hC=(HWND)lp;
+        for(int i=0;i<5;i++)
+            if(hC==g_mouseBoxHwnd[i] && hBox[i]){
+                SetTextColor((HDC)wp,RGB(255,255,255));
+                SetBkMode((HDC)wp,TRANSPARENT);
+                return (LRESULT)hBox[i];
+            }
+        return DefWindowProcW(hw,msg,wp,lp);
+    }
+    case WM_ERASEBKGND:{
+        RECT rc; GetClientRect(hw,&rc);
+        FillRect((HDC)wp,&rc,hBg); return 1;
+    }
+    case WM_CTLCOLORSTATIC:{
+        SetBkMode((HDC)wp,TRANSPARENT);
+        SetTextColor((HDC)wp,RGB(200,215,255));
+        return (LRESULT)hBg;
+    }
+    case WM_CTLCOLOREDIT:{
+        SetBkColor((HDC)wp,RGB(30,35,60));
+        SetTextColor((HDC)wp,RGB(220,235,255));
+        return (LRESULT)hEdit;
+    }
     case WM_CLOSE:
-        SendMessageW(hw, WM_COMMAND, IDC_CAPTCHA_DENY, 0);
+        SendMessageW(hw,WM_COMMAND,IDC_DENY,0);
         return 0;
-
     case WM_DESTROY:
-        Cleanup();
-        return 0;
+        Cleanup(); return 0;
     }
-    return DefWindowProcW(hw, msg, wp, lp);
+    return DefWindowProcW(hw,msg,wp,lp);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CAPTCHA thread — own thread + own message loop so it never blocks the main
-// pump and its messages are always dispatched immediately.
+// CAPTCHA thread
 // ─────────────────────────────────────────────────────────────────────────────
 DWORD WINAPI CaptchaThread(LPVOID param)
 {
-    HANDLE hDevice = (HANDLE)param;
+    g_wrong=0; g_timing.Reset();
+    if(g_chalDC==DevClass::Mouse) g_chal=GenMouseChallenge();
+    else                           g_chal=GenKBChallenge();
 
-    // Register window class once per process
-    static bool reg = false;
-    if (!reg) {
-        WNDCLASSW wc     = {};
-        wc.lpfnWndProc   = CaptchaProc;
-        wc.hInstance     = GetModuleHandleW(NULL);
-        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-        wc.lpszClassName = L"CaptchaClass";
-        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-        RegisterClassW(&wc);
-        reg = true;
+    int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
+
+    static bool regKB=false, regM=false;
+    if(g_chalDC==DevClass::Mouse && !regM){
+        WNDCLASSW wc={}; wc.lpfnWndProc=CaptchaProc;
+        wc.hInstance=GetModuleHandleW(NULL);
+        wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName=L"CaptchaMouse";
+        wc.hCursor=LoadCursorW(NULL,IDC_ARROW);
+        RegisterClassW(&wc); regM=true;
+    }
+    if(g_chalDC!=DevClass::Mouse && !regKB){
+        WNDCLASSW wc={}; wc.lpfnWndProc=CaptchaProc;
+        wc.hInstance=GetModuleHandleW(NULL);
+        wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName=L"CaptchaKeyboard";
+        wc.hCursor=LoadCursorW(NULL,IDC_ARROW);
+        RegisterClassW(&wc); regKB=true;
     }
 
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
-    int w = 510, h = 276;
+    const wchar_t* cls = (g_chalDC==DevClass::Mouse) ? L"CaptchaMouse" : L"CaptchaKeyboard";
+    int w=510, h=(g_chalDC==DevClass::Mouse ? 244 : 270);
 
-    g_hCaptcha = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
-        L"CaptchaClass",
-        L"USB Gatekeeper  —  Security Challenge",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        (sw - w) / 2, (sh - h) / 2, w, h,
-        NULL, NULL, GetModuleHandleW(NULL), NULL);
+    g_hCaptcha=CreateWindowExW(
+        WS_EX_TOPMOST|WS_EX_DLGMODALFRAME,
+        cls, L"USB Gatekeeper",
+        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        (sw-w)/2,(sh-h)/2,w,h,
+        NULL,NULL,GetModuleHandleW(NULL),NULL);
 
-    if (!g_hCaptcha) {
-        std::wcout << L"[ERROR] CAPTCHA window creation failed: "
-                   << GetLastError() << L"\n";
-        std::lock_guard<std::mutex> lk(g_deviceMutex);
-        g_pendingDevices.erase(hDevice);
-        g_captchaDevice = NULL;
-        return 1;
-    }
-
-    ShowWindow(g_hCaptcha, SW_SHOWNORMAL);
+    ShowWindow(g_hCaptcha,SW_SHOWNORMAL);
     UpdateWindow(g_hCaptcha);
     SetForegroundWindow(g_hCaptcha);
 
-    std::wcout << L"[CAPTCHA] Window shown for: " << ShortName(hDevice) << L"\n";
-
-    // Private message loop for this window only
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0)
-    {
-        if (!IsDialogMessageW(g_hCaptcha, &msg)) {
+    while(GetMessageW(&msg,NULL,0,0)>0){
+        if(!IsDialogMessageW(g_hCaptcha,&msg)){
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
+    g_captchaActive=false;
     return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Spawn CAPTCHA thread for a newly-blocked device
+// Show CAPTCHA — atomic to prevent duplicate spawns from repeated WM_DEVICECHANGE
 // ─────────────────────────────────────────────────────────────────────────────
-void ShowCaptchaForDevice(HANDLE hDevice)
+void ShowCaptcha(HANDLE hDev, DevClass dc)
 {
-    if (g_hCaptcha)                      return;
-    if (g_pendingDevices.count(hDevice)) return;
-
-    g_captchaDevice = hDevice;
-    g_pendingDevices.insert(hDevice);
-
-    HANDLE hThread = CreateThread(NULL, 0, CaptchaThread, hDevice, 0, NULL);
-    if (hThread)
-        CloseHandle(hThread);
-    else
-        std::wcout << L"[ERROR] CreateThread failed: " << GetLastError() << L"\n";
+    bool expected=false;
+    if(!g_captchaActive.compare_exchange_strong(expected,true)) return;
+    if(g_pending.count(hDev)){ g_captchaActive=false; return; }
+    g_chalDev=hDev; g_chalDC=dc;
+    { std::lock_guard<std::mutex> lk(g_devMutex); g_pending.insert(hDev); }
+    HANDLE ht=CreateThread(NULL,0,CaptchaThread,hDev,0,NULL);
+    if(ht) CloseHandle(ht);
+    else   g_captchaActive=false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Low-Level Keyboard Hook
+// Low-level keyboard hook
+// When any device is pending: block ALL keystrokes except navigation keys
+// and keystrokes while our own captcha window has focus.
 // ─────────────────────────────────────────────────────────────────────────────
-LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+LRESULT CALLBACK LowLevelKBProc(int nCode, WPARAM wp, LPARAM lp)
 {
-    if (nCode == HC_ACTION)
-    {
-        std::lock_guard<std::mutex> lk(g_deviceMutex);
-        bool isInjected = (g_lastRawDevice == NULL);
-        bool isBlocked  = (!isInjected && g_blockedDevices.count(g_lastRawDevice));
+    if(nCode==HC_ACTION){
+        std::lock_guard<std::mutex> lk(g_devMutex);
+        if(!g_blocked.empty()){
+            // Allow if our captcha window is foreground
+            HWND fg=GetForegroundWindow();
+            DWORD fgPid=0; GetWindowThreadProcessId(fg,&fgPid);
+            if(fgPid==GetCurrentProcessId())
+                return CallNextHookEx(g_kbHook,nCode,wp,lp);
 
-        if (isInjected || isBlocked)
-        {
-            auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-            std::wcout << (isInjected ? L"[BLOCKED-INJECT] " : L"[BLOCKED] ")
-                       << L"VK=0x" << std::hex << kb->vkCode;
-            if (!isInjected) std::wcout << L" from " << ShortName(g_lastRawDevice);
-            std::wcout << L"\n";
-            return 1;
+            // Block blocked device keystrokes
+            if(g_lastRawDevice && g_blocked.count(g_lastRawDevice))
+                return 1;
+
+            // Block software injection
+            if(g_rawReady && g_lastRawDevice==NULL)
+                return 1;
+
+            // Allow navigation so user can alt-tab to captcha
+            auto* kb=reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+            DWORD vk=kb->vkCode;
+            bool nav=(vk==VK_TAB||vk==VK_LMENU||vk==VK_RMENU||
+                      vk==VK_LWIN||vk==VK_RWIN||vk==VK_ESCAPE||
+                      vk==VK_LCONTROL||vk==VK_RCONTROL);
+            if(nav) return CallNextHookEx(g_kbHook,nCode,wp,lp);
+
+            return 1; // block everything else outside captcha
         }
     }
-    return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+    return CallNextHookEx(g_kbHook,nCode,wp,lp);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Background message-only window
+// Background message window
 // ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-    switch (uMsg)
-    {
-    case WM_INPUT:
-    {
-        UINT sz = 0;
-        GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &sz, sizeof(RAWINPUTHEADER));
+    switch(uMsg){
+    case WM_INPUT:{
+        UINT sz=0;
+        GetRawInputData((HRAWINPUT)lParam,RID_INPUT,NULL,&sz,sizeof(RAWINPUTHEADER));
         std::vector<BYTE> buf(sz);
-        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT,
-                            buf.data(), &sz, sizeof(RAWINPUTHEADER)) == sz)
-        {
-            auto* raw = reinterpret_cast<RAWINPUT*>(buf.data());
-            if (raw->header.dwType == RIM_TYPEKEYBOARD)
-                g_lastRawDevice = raw->header.hDevice;
+        if(GetRawInputData((HRAWINPUT)lParam,RID_INPUT,
+                           buf.data(),&sz,sizeof(RAWINPUTHEADER))==sz){
+            auto* raw=reinterpret_cast<RAWINPUT*>(buf.data());
+            if(raw->header.dwType==RIM_TYPEKEYBOARD||
+               raw->header.dwType==RIM_TYPEMOUSE){
+                g_lastRawDevice=raw->header.hDevice;
+                g_rawReady=true;
+            }
         }
-        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+        return DefWindowProcW(hWnd,uMsg,wParam,lParam);
     }
-
-    case WM_DEVICECHANGE:
-    {
-        if (wParam == DBT_DEVICEARRIVAL)
-        {
-            auto* hdr = reinterpret_cast<DEV_BROADCAST_HDR*>(lParam);
-            if (hdr && hdr->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE)
-            {
-                // Brief delay so Windows finishes enumerating the new device
+    case WM_DEVICECHANGE:{
+        if(wParam==DBT_DEVICEARRIVAL){
+            auto* hdr=reinterpret_cast<DEV_BROADCAST_HDR*>(lParam);
+            if(hdr && hdr->dbch_devicetype==DBT_DEVTYP_DEVICEINTERFACE){
                 Sleep(300);
-
-                auto current = EnumerateKeyboardDevices();
-                HANDLE newDev = NULL;
-                {
-                    std::lock_guard<std::mutex> lk(g_deviceMutex);
-                    for (HANDLE h : current)
-                    {
-                        if (!IsTrustedDevice(h) &&
-                            !g_blockedDevices.count(h) &&
-                            !g_pendingDevices.count(h))
-                        {
-                            g_blockedDevices.insert(h);
-                            newDev = h;
-                            std::wcout << L"[ALERT] New keyboard blocked (CAPTCHA pending): "
-                                       << ShortName(h) << L"\n";
+                HANDLE newDev=NULL; DevClass dc=DevClass::Unknown;
+                // Check keyboards
+                auto kbs=EnumByType(RIM_TYPEKEYBOARD);
+                { std::lock_guard<std::mutex> lk(g_devMutex);
+                  for(HANDLE h:kbs){
+                      std::wstring hn=GetDevName(h),hvid=GetVID(hn);
+                      bool denied=g_deniedNames.count(hn)||(!hvid.empty()&&g_deniedVIDs.count(hvid));
+                      if(!IsTrusted(h)&&!denied&&!g_blocked.count(h)&&!g_pending.count(h)){
+                          g_blocked.insert(h); newDev=h; dc=DevClass::Keyboard;
+                          std::wcout<<L"[ALERT] New keyboard: "<<ShortName(h)<<L"\n";
+                          break;
+                      }
+                  }
+                }
+                // Check mice if no keyboard found
+                if(!newDev){
+                    auto mice=EnumByType(RIM_TYPEMOUSE);
+                    std::lock_guard<std::mutex> lk(g_devMutex);
+                    for(HANDLE h:mice){
+                        std::wstring hn=GetDevName(h),hvid=GetVID(hn);
+                        bool denied=g_deniedNames.count(hn)||(!hvid.empty()&&g_deniedVIDs.count(hvid));
+                        if(!IsTrusted(h)&&!denied&&!g_blocked.count(h)&&!g_pending.count(h)){
+                            newDev=h; dc=DevClass::Mouse;
+                            std::wcout<<L"[ALERT] New mouse: "<<ShortName(h)<<L"\n";
+                            break;
                         }
                     }
                 }
-                // ShowCaptchaForDevice spawns its own thread so this returns immediately
-                if (newDev) ShowCaptchaForDevice(newDev);
+                if(newDev) ShowCaptcha(newDev,dc);
             }
-        }
-        else if (wParam == DBT_DEVICEREMOVECOMPLETE)
-        {
-            auto current = EnumerateKeyboardDevices();
-            std::lock_guard<std::mutex> lk(g_deviceMutex);
-
-            for (auto it = g_blockedDevices.begin(); it != g_blockedDevices.end(); )
-                it = current.count(*it) ? ++it : g_blockedDevices.erase(it);
-            for (auto it = g_pendingDevices.begin(); it != g_pendingDevices.end(); )
-                it = current.count(*it) ? ++it : g_pendingDevices.erase(it);
-
-            if (g_captchaDevice && !current.count(g_captchaDevice))
-            {
-                if (g_hCaptcha) { DestroyWindow(g_hCaptcha); g_hCaptcha = NULL; }
-                g_captchaDevice = NULL;
+        } else if(wParam==DBT_DEVICEREMOVECOMPLETE){
+            auto kbs=EnumByType(RIM_TYPEKEYBOARD);
+            auto mice=EnumByType(RIM_TYPEMOUSE);
+            std::set<HANDLE> all;
+            all.insert(kbs.begin(),kbs.end());
+            all.insert(mice.begin(),mice.end());
+            std::lock_guard<std::mutex> lk(g_devMutex);
+            for(auto it=g_blocked.begin();it!=g_blocked.end();)
+                it=all.count(*it)?++it:g_blocked.erase(it);
+            for(auto it=g_pending.begin();it!=g_pending.end();)
+                it=all.count(*it)?++it:g_pending.erase(it);
+            if(g_chalDev && !all.count(g_chalDev)){
+                if(g_hCaptcha){ DestroyWindow(g_hCaptcha); g_hCaptcha=NULL; }
+                g_chalDev=NULL; g_captchaActive=false;
             }
         }
         return TRUE;
     }
-
     case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
+        PostQuitMessage(0); return 0;
     }
-    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    return DefWindowProcW(hWnd,uMsg,wParam,lParam);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -588,92 +681,58 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 // ─────────────────────────────────────────────────────────────────────────────
 int main()
 {
-    BYTE test[4] = {};
-    if (!CryptoRandomBytes(test, 4)) {
-        std::wcerr << L"[FATAL] BCryptGenRandom unavailable.\n";
-        return 1;
-    }
-    std::wcout << L"[INFO] BCryptGenRandom: OK\n";
+    BYTE test[4]={};
+    if(!CryptoRandomBytes(test,4)){ std::wcerr<<L"[FATAL] BCrypt init failed\n"; return 1; }
+    std::wcout<<L"[INFO] BCryptGenRandom OK\n";
 
-    // 1. Snapshot trusted keyboards by handle AND name
-    {
-        std::lock_guard<std::mutex> lk(g_deviceMutex);
-        g_trustedDevices = EnumerateKeyboardDevices();
-        for (HANDLE h : g_trustedDevices) {
-            std::wstring n = GetDeviceName(h);
-            g_trustedNames.insert(n);
-            std::wcout << L"[TRUSTED] " << n << L"\n";
-        }
-        std::wcout << L"[INFO] " << g_trustedDevices.size()
-                   << L" trusted keyboard(s) at startup.\n\n";
-    }
+    // Snapshot trusted devices at startup
+    { std::lock_guard<std::mutex> lk(g_devMutex);
+      for(HANDLE h:EnumByType(RIM_TYPEKEYBOARD)) TrustDev(h);
+      for(HANDLE h:EnumByType(RIM_TYPEMOUSE))    TrustDev(h);
+      std::wcout<<L"[INFO] "<<g_trusted.size()<<L" trusted devices at startup\n"; }
 
-    // 2. Invisible message-only window
-    WNDCLASSW wc     = {};
-    wc.lpfnWndProc   = WindowProc;
-    wc.hInstance     = GetModuleHandleW(NULL);
-    wc.lpszClassName = L"USBGatekeeperBg";
+    // Background message window
+    WNDCLASSW wc={};
+    wc.lpfnWndProc=WindowProc;
+    wc.hInstance=GetModuleHandleW(NULL);
+    wc.lpszClassName=L"USBGatekeeperBg";
     RegisterClassW(&wc);
+    g_hWnd=CreateWindowExW(0,L"USBGatekeeperBg",L"",0,0,0,0,0,
+                           HWND_MESSAGE,NULL,wc.hInstance,NULL);
+    if(!g_hWnd){ std::wcerr<<L"[ERROR] "<<GetLastError()<<L"\n"; return 1; }
 
-    g_hWnd = CreateWindowExW(0, L"USBGatekeeperBg", L"",
-        0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
-    if (!g_hWnd) {
-        std::wcerr << L"[ERROR] CreateWindowEx: " << GetLastError() << L"\n";
-        return 1;
-    }
+    // Raw Input — track which physical device is typing
+    RAWINPUTDEVICE rids[2]={};
+    rids[0].usUsagePage=HID_USAGE_PAGE_GENERIC;
+    rids[0].usUsage=HID_USAGE_GENERIC_KEYBOARD;
+    rids[0].dwFlags=RIDEV_INPUTSINK; rids[0].hwndTarget=g_hWnd;
+    rids[1].usUsagePage=HID_USAGE_PAGE_GENERIC;
+    rids[1].usUsage=HID_USAGE_GENERIC_MOUSE;
+    rids[1].dwFlags=RIDEV_INPUTSINK; rids[1].hwndTarget=g_hWnd;
+    RegisterRawInputDevices(rids,2,sizeof(RAWINPUTDEVICE));
 
-    // 3. Raw Input — all keyboards, even when unfocused
-    RAWINPUTDEVICE rid = {};
-    rid.usUsagePage = HID_USAGE_PAGE_GENERIC;
-    rid.usUsage     = HID_USAGE_GENERIC_KEYBOARD;
-    rid.dwFlags     = RIDEV_INPUTSINK;
-    rid.hwndTarget  = g_hWnd;
-    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
-        std::wcerr << L"[ERROR] RegisterRawInputDevices: " << GetLastError() << L"\n";
-        return 1;
-    }
+    // Device arrival notifications
+    DEV_BROADCAST_DEVICEINTERFACE nf={};
+    nf.dbcc_size=sizeof(nf);
+    nf.dbcc_devicetype=DBT_DEVTYP_DEVICEINTERFACE;
+    nf.dbcc_classguid={0x4D1E55B2,0xF16F,0x11CF,
+                       {0x88,0xCB,0x00,0x11,0x11,0x00,0x00,0x30}};
+    g_hDevNotify=RegisterDeviceNotificationW(g_hWnd,&nf,DEVICE_NOTIFY_WINDOW_HANDLE);
 
-    // 4. Device-arrival notifications
-    DEV_BROADCAST_DEVICEINTERFACE nf = {};
-    nf.dbcc_size       = sizeof(nf);
-    nf.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-    nf.dbcc_classguid  = { 0x4D1E55B2, 0xF16F, 0x11CF,
-                           {0x88,0xCB,0x00,0x11,0x11,0x00,0x00,0x30} };
-    g_hDevNotify = RegisterDeviceNotificationW(
-        g_hWnd, &nf, DEVICE_NOTIFY_WINDOW_HANDLE);
-    if (!g_hDevNotify) {
-        std::wcerr << L"[ERROR] RegisterDeviceNotification: " << GetLastError() << L"\n";
-        return 1;
-    }
+    // Keyboard hook
+    g_kbHook=SetWindowsHookExW(WH_KEYBOARD_LL,LowLevelKBProc,
+                                GetModuleHandleW(NULL),0);
 
-    // 5. System-wide low-level keyboard hook
-    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
-                                  GetModuleHandleW(NULL), 0);
-    if (!g_kbHook) {
-        std::wcerr << L"[ERROR] SetWindowsHookEx: " << GetLastError() << L"\n";
-        return 1;
-    }
+    std::wcout<<L"\n[USB Gatekeeper] Active. Plug in a device to test.\n\n";
 
-    std::wcout << L"[INFO] USB Gatekeeper active.\n"
-               << L"       Plug in USB keyboard  ->  CAPTCHA popup appears.\n"
-               << L"       Run .ahk script        ->  keystrokes blocked.\n"
-               << L"       3 wrong answers         ->  permanent block.\n"
-               << L"       Ctrl+C to exit.\n\n";
-
-    // 6. Main message pump — no IsDialogMessage needed, CAPTCHA is on its own thread
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0)
-    {
+    while(GetMessageW(&msg,NULL,0,0)>0){
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    // 7. Cleanup
     UnhookWindowsHookEx(g_kbHook);
     UnregisterDeviceNotification(g_hDevNotify);
-    if (g_hCaptcha) DestroyWindow(g_hCaptcha);
     DestroyWindow(g_hWnd);
-
-    std::wcout << L"[INFO] Gatekeeper stopped.\n";
     return 0;
 }

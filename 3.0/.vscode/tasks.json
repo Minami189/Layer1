@@ -16,7 +16,6 @@
                 "-lgdi32",
                 "-lhid",
                 "-lsetupapi",
-                "-lcomctl32",
                 "-lbcrypt",
                 "-mwindows"
             ],
