@@ -566,31 +566,50 @@ void ShowCaptcha(HANDLE hDev, DevClass dc)
 LRESULT CALLBACK LowLevelKBProc(int nCode, WPARAM wp, LPARAM lp)
 {
     if(nCode==HC_ACTION){
+        auto* kb=reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+
+        // LLKHF_INJECTED is set synchronously by Windows for ANY software injection
+        // (SendInput, keybd_event, AutoHotkey, etc.) — no race with WM_INPUT.
+        bool injected=(kb->flags & LLKHF_INJECTED) != 0;
+        if(injected){
+            // Get virtual key name for logging
+            wchar_t keyName[32]=L"?";
+            UINT scanCode=MapVirtualKeyW(kb->vkCode,MAPVK_VK_TO_VSC);
+            GetKeyNameTextW((scanCode<<16),keyName,32);
+            std::wcout<<L"[BLOCKED] Injected keystroke: VK=0x"
+                      <<std::hex<<std::uppercase<<kb->vkCode
+                      <<std::dec<<L" ("<<keyName<<L")\n";
+            return 1;
+        }
+
         std::lock_guard<std::mutex> lk(g_devMutex);
         if(!g_blocked.empty()){
-            // Allow if our captcha window is foreground
+            // Allow if our captcha window is foreground (user typing answer)
             HWND fg=GetForegroundWindow();
             DWORD fgPid=0; GetWindowThreadProcessId(fg,&fgPid);
             if(fgPid==GetCurrentProcessId())
                 return CallNextHookEx(g_kbHook,nCode,wp,lp);
 
-            // Block blocked device keystrokes
-            if(g_lastRawDevice && g_blocked.count(g_lastRawDevice))
+            // Block if this physical device handle is in the blocked set
+            if(g_lastRawDevice && g_blocked.count(g_lastRawDevice)){
+                wchar_t keyName[32]=L"?";
+                UINT scanCode=MapVirtualKeyW(kb->vkCode,MAPVK_VK_TO_VSC);
+                GetKeyNameTextW((scanCode<<16),keyName,32);
+                std::wcout<<L"[BLOCKED] BadUSB keystroke: VK=0x"
+                          <<std::hex<<std::uppercase<<kb->vkCode
+                          <<std::dec<<L" ("<<keyName<<L")\n";
                 return 1;
+            }
 
-            // Block software injection
-            if(g_rawReady && g_lastRawDevice==NULL)
-                return 1;
-
-            // Allow navigation so user can alt-tab to captcha
-            auto* kb=reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+            // Allow navigation keys so user can alt-tab to captcha window
             DWORD vk=kb->vkCode;
             bool nav=(vk==VK_TAB||vk==VK_LMENU||vk==VK_RMENU||
                       vk==VK_LWIN||vk==VK_RWIN||vk==VK_ESCAPE||
                       vk==VK_LCONTROL||vk==VK_RCONTROL);
             if(nav) return CallNextHookEx(g_kbHook,nCode,wp,lp);
 
-            return 1; // block everything else outside captcha
+            std::wcout<<L"[BLOCKED] Keystroke outside captcha window\n";
+            return 1; // block all other typing outside captcha
         }
     }
     return CallNextHookEx(g_kbHook,nCode,wp,lp);
@@ -681,6 +700,13 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 // ─────────────────────────────────────────────────────────────────────────────
 int main()
 {
+    // Allocate a console so std::wcout works under -mwindows
+    AllocConsole();
+    SetConsoleTitleW(L"USB Gatekeeper — Log");
+    FILE* f; freopen_s(&f,"CONOUT$","w",stdout);
+    freopen_s(&f,"CONOUT$","w",stderr);
+    std::wcout.clear(); std::wcerr.clear();
+
     BYTE test[4]={};
     if(!CryptoRandomBytes(test,4)){ std::wcerr<<L"[FATAL] BCrypt init failed\n"; return 1; }
     std::wcout<<L"[INFO] BCryptGenRandom OK\n";
