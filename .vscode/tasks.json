@@ -2,36 +2,42 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "type": "cppbuild",
             "label": "Build USB Gatekeeper",
+            "type": "shell",
             "command": "C:\\msys64\\ucrt64\\bin\\g++.exe",
             "args": [
-                "-fdiagnostics-color=always",
                 "-std=c++17",
-                "-g",
-                "${file}",
-                "-o",
-                "${fileDirname}\\${fileBasenameNoExtension}.exe",
-                "-luser32",
-                "-lgdi32",
-                "-lhid",
-                "-lsetupapi",
-                "-lbcrypt",
-                "-lcomctl32",
-                "-lshell32",
+                "-o", "usb_gatekeeper.exe",
+                "usb_gatekeeper.cpp",
+                "app_manifest.o",
+                "-luser32", "-lgdi32", "-lhid",
+                "-lsetupapi", "-lbcrypt", "-lcomctl32",
                 "-mwindows"
             ],
             "options": {
-                "cwd": "C:\\msys64\\ucrt64\\bin"
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": ["/d", "/c"]
+                }
             },
-            "problemMatcher": [
-                "$gcc"
-            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Compiler task for usb_gatekeeper with full Windows API linking."
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Run USB Gatekeeper",
+            "type": "shell",
+            "command": "Start-Process -FilePath .\\usb_gatekeeper.exe -Verb RunAs",
+            "options": {
+                "shell": {
+                    "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                    "args": ["-Command"]
+                }
+            },
+            "dependsOn": "Build USB Gatekeeper",
+            "problemMatcher": []
         }
     ]
 }
