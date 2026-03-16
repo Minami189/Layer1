@@ -16,6 +16,7 @@
  */
 
 #define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
 #define UNICODE
 #define _UNICODE
 #define _WIN32_IE 0x0600
@@ -43,6 +44,12 @@
 #include <algorithm>
 
 #pragma comment(lib,"comctl32.lib")
+#pragma comment(lib,"shell32.lib")
+#pragma comment(lib,"bcrypt.lib")
+#pragma comment(lib,"user32.lib")
+#pragma comment(lib,"gdi32.lib")
+#pragma comment(lib,"setupapi.lib")
+#pragma comment(lib,"hid.lib")
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IDs
@@ -208,14 +215,16 @@ std::wstring GetDevName(HANDLE h)
 {
     UINT sz=0; GetRawInputDeviceInfoW(h,RIDI_DEVICENAME,NULL,&sz);
     if(!sz) return L"<unknown>";
-    std::wstring s(sz,L'\0'); GetRawInputDeviceInfoW(h,RIDI_DEVICENAME,s.data(),&sz);
-    return s;
+    std::vector<wchar_t> buf(sz);
+    GetRawInputDeviceInfoW(h,RIDI_DEVICENAME,buf.data(),&sz);
+    return std::wstring(buf.data());
 }
 std::wstring ExtractToken(const std::wstring& name, const std::wstring& prefix)
 {
     auto p=name.find(prefix); if(p==std::wstring::npos) return L"";
     p+=prefix.size(); auto e=name.find_first_of(L"&#\\/",p);
-    return name.substr(p, e==std::wstring::npos?8:std::min((size_t)8,e-p));
+    size_t len=(e==std::wstring::npos)?8:e-p; if(len>8)len=8;
+    return name.substr(p,len);
 }
 std::wstring GetVID(const std::wstring& name){ return ExtractToken(name,L"VID_"); }
 std::wstring GetPID(const std::wstring& name){ return ExtractToken(name,L"PID_"); }
@@ -272,7 +281,9 @@ void SaveDB()
 {
     if(g_dbPath.empty()) return;
     // Use narrow fstream - MinGW wofstream doesn't accept wstring path
-    std::ofstream f(g_dbPath.c_str());
+    // Convert wstring path to narrow for cross-compiler compatibility
+    std::string narrowPath(g_dbPath.begin(),g_dbPath.end());
+    std::ofstream f(narrowPath.c_str());
     if(!f) return;
     for(auto& kv:g_db){
         auto& r=kv.second;
@@ -287,7 +298,8 @@ void SaveDB()
 void LoadDB()
 {
     if(g_dbPath.empty()) return;
-    std::ifstream f(g_dbPath.c_str());
+    std::string narrowPath(g_dbPath.begin(),g_dbPath.end());
+    std::ifstream f(narrowPath.c_str());
     if(!f) return;
     std::string lineA;
     while(std::getline(f,lineA)){
@@ -719,7 +731,8 @@ LRESULT CALLBACK LowLevelKBProc(int nCode, WPARAM wp, LPARAM lp)
         if(kb->flags & LLKHF_INJECTED){
             wchar_t kn[32]=L"?"; UINT sc=MapVirtualKeyW(kb->vkCode,MAPVK_VK_TO_VSC);
             GetKeyNameTextW((LONG)(sc<<16),kn,32);
-            AppLog(L"[BLOCKED] Injection: VK=0x"+[&](){std::wostringstream s;s<<std::hex<<std::uppercase<<kb->vkCode;return s.str();}()+L" ("+kn+L")");
+            {std::wostringstream _s;_s<<std::hex<<std::uppercase<<kb->vkCode;
+            AppLog(L"[BLOCKED] Injection: VK=0x"+_s.str()+L" ("+kn+L")");}
             return 1;
         }
 
@@ -1022,7 +1035,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 if(g_blocked.count(h)&&!g_pending.count(h)&&DBStatus(h)==DevRecord::Status::Unknown)
                     toChallenge.push_back({h,DevClass::Mouse});
         }
-        for(auto& [h,dc]:toChallenge) ShowCaptcha(h,dc);
+        for(size_t i=0;i<toChallenge.size();i++) ShowCaptcha(toChallenge[i].first,toChallenge[i].second);
     }
 
     // Register main GUI window class

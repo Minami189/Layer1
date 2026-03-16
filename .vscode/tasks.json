@@ -3,15 +3,15 @@
     "tasks": [
         {
             "type": "cppbuild",
-            "label": "C/C++: g++.exe build active file",
-            "command": "C:/msys64/ucrt64/bin/g++.exe",
+            "label": "Build USB Gatekeeper",
+            "command": "C:\\msys64\\ucrt64\\bin\\g++.exe",
             "args": [
                 "-fdiagnostics-color=always",
                 "-std=c++17",
                 "-g",
                 "${file}",
                 "-o",
-                "${fileDirname}/${fileBasenameNoExtension}.exe",
+                "${fileDirname}\\${fileBasenameNoExtension}.exe",
                 "-luser32",
                 "-lgdi32",
                 "-lhid",
@@ -22,13 +22,16 @@
                 "-mwindows"
             ],
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "C:\\msys64\\ucrt64\\bin"
             },
-            "problemMatcher": ["$gcc"],
+            "problemMatcher": [
+                "$gcc"
+            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
-            }
+            },
+            "detail": "Compiler task for usb_gatekeeper with full Windows API linking."
         }
     ]
 }
