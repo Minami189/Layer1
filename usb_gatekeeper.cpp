@@ -1,20 +1,3 @@
-/*
- * USB Gatekeeper v4.0 — BadUSB Interceptor with Persistent Storage + Management GUI
- *
- * BUILD (MSYS2 UCRT64, run as Admin):
- *   g++ -std=c++17 -o usb_gatekeeper.exe usb_gatekeeper.cpp \
- *       -luser32 -lgdi32 -lhid -lsetupapi -lbcrypt -lcomctl32 -mwindows
- *
- * FEATURES:
- *   - Blocks new USB keyboards/mice until CAPTCHA solved
- *   - Persistent allow/block list saved to usb_gatekeeper_db.txt (same folder as exe)
- *   - Main GUI window: live log, connected devices list, allow/block buttons
- *   - Stores VID, PID, serial, full device name per entry
- *   - CAPTCHA: scramble/hex/token for keyboards, color-click for mice
- *   - Timing analysis detects robotic input
- *   - LLKHF_INJECTED blocks AutoHotkey/SendInput
- */
-
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #define UNICODE
@@ -30,11 +13,13 @@
 #include <hidusage.h>
 #include <setupapi.h>
 #include <hidsdi.h>
+#include <hidpi.h>
 #include <shellapi.h>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <deque>
 #include <set>
 #include <map>
 #include <string>
@@ -52,7 +37,13 @@
 #pragma comment(lib, "hid.lib")
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IDs
+// [SUGGEST A] Auto-deny timeout for the CAPTCHA window.  Set to 0 to disable.
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr UINT CAPTCHA_TIMEOUT_MS = 60000;
+#define CAPTCHA_TIMER_ID 42
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Control IDs
 // ─────────────────────────────────────────────────────────────────────────────
 #define IDC_LABEL 101
 #define IDC_SUBLABEL 102
@@ -65,26 +56,37 @@
 #define IDC_T4 204
 #define IDC_T5 205
 
-// Main window controls
 #define IDC_LOG 1001
 #define IDC_DEVLIST 1002
 #define IDC_BTN_ALLOW 1003
 #define IDC_BTN_BLOCK 1004
 #define IDC_BTN_CLEAR 1005
 #define IDC_BTN_FORGET 1006
-#define IDC_STATIC_LOG 1006
-#define IDC_STATIC_DEV 1007
+#define IDC_CHK_ALLOWLIST 1007
+#define IDC_CHK_REMBLOCKED 1008
+#define IDC_STATIC_LOG 1009
+#define IDC_STATIC_DEV 1010
+#define IDC_STATIC_SETTINGS 1011
+#define IDC_BTN_REFRESH 1012
+
+// Custom window messages
+#define WM_TRAYICON (WM_USER + 1)
+#define WM_NEXT_CAPTCHA (WM_USER + 2)    // [FIX 2] posted by captcha thread on exit
+#define WM_DISMISS_CAPTCHA (WM_USER + 3) // [FIX 2] clean shutdown without DenyDevice
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Device record
 // ─────────────────────────────────────────────────────────────────────────────
 struct DevRecord
 {
-    std::wstring vid;
-    std::wstring pid;
-    std::wstring serial;
+    std::wstring vid, pid;
+    std::wstring instanceId;
+    std::wstring manufacturer;
+    std::wstring product;
+    std::wstring usbSerial;
     std::wstring fullName;
     std::wstring friendly;
+    USHORT version = 0;
     enum class Status
     {
         Unknown,
@@ -94,7 +96,7 @@ struct DevRecord
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BCrypt
+// BCrypt helpers
 // ─────────────────────────────────────────────────────────────────────────────
 bool CryptoRandomBytes(void *buf, size_t len)
 {
@@ -114,7 +116,7 @@ DWORD CryptoRandRange(DWORD upper)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Challenge
+// Challenge types
 // ─────────────────────────────────────────────────────────────────────────────
 enum class ChalType
 {
@@ -129,7 +131,6 @@ enum class DevClass
     Mouse,
     Unknown
 };
-
 struct Challenge
 {
     ChalType type;
@@ -137,12 +138,15 @@ struct Challenge
     int colorIdx = 0, targetBox = 0, boxColors[5] = {};
 };
 
-static const wchar_t *WORDS[] =
-    {L"PLANET", L"BRIDGE", L"FALCON", L"SPIDER", L"WINTER", L"GARDEN", L"MIRROR",
-     L"CASTLE", L"DRAGON", L"SILVER", L"FOREST", L"ROCKET", L"MARBLE", L"HUNTER",
-     L"COBALT", L"STRIKE", L"VECTOR", L"TURRET", L"CANYON", L"PRISM"};
+static const wchar_t *WORDS[] = {
+    L"PLANET", L"BRIDGE", L"FALCON", L"SPIDER", L"WINTER",
+    L"GARDEN", L"MIRROR", L"CASTLE", L"DRAGON", L"SILVER",
+    L"FOREST", L"ROCKET", L"MARBLE", L"HUNTER", L"COBALT",
+    L"STRIKE", L"VECTOR", L"TURRET", L"CANYON", L"PRISM"};
 static const wchar_t *CNAMES[] = {L"RED", L"GREEN", L"BLUE", L"YELLOW", L"ORANGE"};
-static const COLORREF CVALS[] = {RGB(210, 45, 45), RGB(45, 170, 45), RGB(45, 90, 210), RGB(210, 190, 0), RGB(210, 110, 0)};
+static const COLORREF CVALS[] = {
+    RGB(210, 45, 45), RGB(45, 170, 45), RGB(45, 90, 210),
+    RGB(210, 190, 0), RGB(210, 110, 0)};
 
 std::wstring ScrambleWord(const std::wstring &w)
 {
@@ -246,7 +250,7 @@ bool WEqCI(const std::wstring &a, const std::wstring &b)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Timing
+// Timing analysis
 // ─────────────────────────────────────────────────────────────────────────────
 struct Timing
 {
@@ -273,20 +277,34 @@ struct Timing
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Feature toggles
+// ─────────────────────────────────────────────────────────────────────────────
+static bool g_allowListingEnabled = true;
+static bool g_rememberBlockedEnabled = true;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Globals
 // ─────────────────────────────────────────────────────────────────────────────
 std::map<std::wstring, DevRecord> g_db;
 std::set<HANDLE> g_trusted;
 std::set<std::wstring> g_trustedNames;
-std::set<std::wstring> g_trustedVIDs;
+std::set<std::wstring> g_trustedVIDPIDs; // "VID_xxxx&PID_xxxx"
 std::set<HANDLE> g_blocked;
 std::set<HANDLE> g_pending;
 std::mutex g_devMutex;
 
-// Ring buffer: last 4 raw input device handles (replaces single g_lastRawDevice)
 static HANDLE g_rawRing[4] = {};
 static int g_rawRingIdx = 0;
 static std::atomic<bool> g_captchaActive{false};
+
+// [FIX 2] CAPTCHA queue ───────────────────────────────────────────────────────
+struct CaptchaQueueItem
+{
+    HANDLE dev;
+    DevClass dc;
+};
+static std::deque<CaptchaQueueItem> g_captchaQueue;
+static std::mutex g_captchaQueueMtx;
 
 HHOOK g_kbHook = NULL;
 HWND g_hWnd = NULL;
@@ -295,6 +313,26 @@ HWND g_hCaptcha = NULL;
 HWND g_hLog = NULL;
 HWND g_hDevList = NULL;
 HDEVNOTIFY g_hDevNotify = NULL;
+HWND g_hTrayWnd = NULL; // [SUGGEST B]
+
+static HWND g_hStaticLog = NULL;
+static HWND g_hStaticDev = NULL;
+static HWND g_hStaticSettings = NULL;
+static HWND g_hBtnAllow = NULL;
+static HWND g_hBtnBlock = NULL;
+static HWND g_hBtnClear = NULL;
+static HWND g_hBtnForget = NULL;
+static HWND g_hBtnRefresh = NULL;
+static HWND g_hChkAllowList = NULL;
+static HWND g_hChkRemBlocked = NULL;
+
+// Drag-splitter
+static int g_logHeight = 160;
+static bool g_splitterDrag = false;
+static int g_dragBaseY = 0;
+static int g_dragBaseLogH = 0;
+static int g_splitterTopY = 0;
+#define SPLITTER_H 6
 
 static Challenge g_chal;
 static HANDLE g_chalDev = NULL;
@@ -303,11 +341,19 @@ static int g_wrong = 0;
 static const int MAX_WRONG = 3;
 static Timing g_timing;
 static HWND g_mouseBoxHwnd[5] = {};
-
 static std::wstring g_dbPath;
 
+NOTIFYICONDATAW g_nid = {};
+#define IDI_TRAY 1
+
+// Forward declarations
+void AppLog(const std::wstring &msg);
+void RefreshDevList();
+void ProcessCaptchaQueue();
+void UpdateTrayTooltip();
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Device identity helpers
+// Device path helpers
 // ─────────────────────────────────────────────────────────────────────────────
 std::wstring GetDevName(HANDLE h)
 {
@@ -319,6 +365,7 @@ std::wstring GetDevName(HANDLE h)
     GetRawInputDeviceInfoW(h, RIDI_DEVICENAME, buf.data(), &sz);
     return std::wstring(buf.data());
 }
+
 std::wstring ExtractToken(const std::wstring &name, const std::wstring &prefix)
 {
     auto p = name.find(prefix);
@@ -331,23 +378,23 @@ std::wstring ExtractToken(const std::wstring &name, const std::wstring &prefix)
         len = 8;
     return name.substr(p, len);
 }
-std::wstring GetVID(const std::wstring &name) { return ExtractToken(name, L"VID_"); }
-std::wstring GetPID(const std::wstring &name) { return ExtractToken(name, L"PID_"); }
-std::wstring GetSerial(const std::wstring &name)
+std::wstring GetVID(const std::wstring &n) { return ExtractToken(n, L"VID_"); }
+std::wstring GetPID(const std::wstring &n) { return ExtractToken(n, L"PID_"); }
+
+std::wstring GetInstanceId(const std::wstring &n)
 {
-    auto p = name.find(L"PID_");
-    if (p == std::wstring::npos)
+    auto p1 = n.find(L'#');
+    if (p1 == std::wstring::npos)
         return L"<none>";
-    p = name.find(L'\\', p);
-    if (p == std::wstring::npos)
+    auto p2 = n.find(L'#', p1 + 1);
+    if (p2 == std::wstring::npos)
         return L"<none>";
-    ++p;
-    auto e = name.find(L'#', p);
-    std::wstring s = name.substr(p, e == std::wstring::npos ? std::wstring::npos : e - p);
-    if (s.empty() || s == L"&")
-        return L"<none>";
-    return s;
+    auto p3 = n.find(L'#', p2 + 1);
+    std::wstring inst = n.substr(p2 + 1, p3 == std::wstring::npos ? std::wstring::npos : p3 - p2 - 1);
+    return inst.empty() ? L"<none>" : inst;
 }
+inline std::wstring GetSerial(const std::wstring &n) { return GetInstanceId(n); }
+
 std::wstring ShortName(HANDLE h)
 {
     std::wstring f = GetDevName(h);
@@ -359,6 +406,7 @@ std::wstring ShortName(HANDLE h)
         return f.substr(p, 16);
     return f.size() > 40 ? f.substr(0, 40) + L"..." : f;
 }
+
 std::set<HANDLE> EnumByType(DWORD type)
 {
     std::set<HANDLE> out;
@@ -374,9 +422,78 @@ std::set<HANDLE> EnumByType(DWORD type)
             out.insert(d.hDevice);
     return out;
 }
+
 std::wstring MakeDBKey(const std::wstring &fullName)
 {
-    return L"VID_" + GetVID(fullName) + L"&PID_" + GetPID(fullName) + L"&SER_" + GetSerial(fullName);
+    return L"VID_" + GetVID(fullName) + L"&PID_" + GetPID(fullName) + L"&INST_" + GetInstanceId(fullName);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [FIX 1] Device key — VID + PID + Instance for arrival matching.
+//
+// Both dbcc_name (from WM_DEVICECHANGE) and RIDI_DEVICENAME embed all three
+// tokens in the same '#'-separated path format, so we can match them directly.
+// We normalise to uppercase for case-insensitive comparison.
+// If instance extraction fails ("<none>") we fall back to VID+PID-only matching;
+// this degrades gracefully to the pre-v4.2 behaviour for pathological paths.
+// ─────────────────────────────────────────────────────────────────────────────
+struct DevKey
+{
+    std::wstring vid, pid, inst;
+};
+
+static std::wstring ToUpper(std::wstring s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), towupper);
+    return s;
+}
+DevKey ExtractDevKey(const std::wstring &path)
+{
+    return {ToUpper(GetVID(path)), ToUpper(GetPID(path)), ToUpper(GetInstanceId(path))};
+}
+bool DevKeyMatch(const DevKey &a, const DevKey &b)
+{
+    if (a.vid.empty() || b.vid.empty())
+        return false;
+    if (a.vid != b.vid || a.pid != b.pid)
+        return false;
+    // If either instance is "<NONE>" (extraction failed) accept on VID+PID alone
+    if (a.inst == L"<NONE>" || b.inst == L"<NONE>")
+        return true;
+    return a.inst == b.inst;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HID descriptor
+// ─────────────────────────────────────────────────────────────────────────────
+struct HIDDescriptor
+{
+    std::wstring manufacturer = L"<unknown>";
+    std::wstring product = L"<unknown>";
+    std::wstring usbSerial = L"<none>";
+    USHORT version = 0;
+};
+HIDDescriptor GetHIDDescriptor(const std::wstring &devPath)
+{
+    HIDDescriptor d;
+    HANDLE hDev = CreateFileW(devPath.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, 0, NULL);
+    if (hDev == INVALID_HANDLE_VALUE)
+        return d;
+    wchar_t buf[256] = {};
+    if (HidD_GetManufacturerString(hDev, buf, sizeof(buf)) && buf[0])
+        d.manufacturer = buf;
+    wmemset(buf, 0, 256);
+    if (HidD_GetProductString(hDev, buf, sizeof(buf)) && buf[0])
+        d.product = buf;
+    wmemset(buf, 0, 256);
+    if (HidD_GetSerialNumberString(hDev, buf, sizeof(buf)) && buf[0])
+        d.usbSerial = buf;
+    HIDD_ATTRIBUTES attrs = {sizeof(attrs)};
+    if (HidD_GetAttributes(hDev, &attrs))
+        d.version = attrs.VersionNumber;
+    CloseHandle(hDev);
+    return d;
 }
 DevRecord BuildRecord(HANDLE h)
 {
@@ -384,73 +501,93 @@ DevRecord BuildRecord(HANDLE h)
     r.fullName = GetDevName(h);
     r.vid = GetVID(r.fullName);
     r.pid = GetPID(r.fullName);
-    r.serial = GetSerial(r.fullName);
-    r.friendly = L"VID_" + r.vid + L"&PID_" + r.pid;
+    r.instanceId = GetInstanceId(r.fullName);
+    HIDDescriptor desc = GetHIDDescriptor(r.fullName);
+    r.manufacturer = desc.manufacturer;
+    r.product = desc.product;
+    r.usbSerial = desc.usbSerial;
+    r.version = desc.version;
+    if (r.manufacturer != L"<unknown>" && r.product != L"<unknown>")
+        r.friendly = r.manufacturer + L" " + r.product;
+    else if (r.product != L"<unknown>")
+        r.friendly = r.product;
+    else
+        r.friendly = L"VID_" + r.vid + L"&PID_" + r.pid;
     return r;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Persistent DB
 // ─────────────────────────────────────────────────────────────────────────────
+static std::string WtoA(const std::wstring &w)
+{
+    std::string s;
+    for (wchar_t c : w)
+        s += (c < 128 ? (char)c : '?');
+    return s;
+}
 void SaveDB()
 {
     if (g_dbPath.empty())
         return;
-    std::string narrowPath(g_dbPath.begin(), g_dbPath.end());
-    std::ofstream f(narrowPath.c_str());
+    std::ofstream f(WtoA(g_dbPath).c_str());
     if (!f)
         return;
     for (auto &kv : g_db)
     {
         auto &r = kv.second;
-        char st = 'U';
-        if (r.status == DevRecord::Status::Allowed)
-            st = 'A';
-        if (r.status == DevRecord::Status::Blocked)
-            st = 'B';
-        auto W = [](const std::wstring &w)
-        { std::string s; for(wchar_t c:w) s+=(c<128?(char)c:'?'); return s; };
-        f << st << '|' << W(r.vid) << '|' << W(r.pid) << '|' << W(r.serial) << '|' << W(r.fullName) << '\n';
+        char st = (r.status == DevRecord::Status::Allowed) ? 'A' : (r.status == DevRecord::Status::Blocked) ? 'B'
+                                                                                                            : 'U';
+        f << st << '|' << WtoA(r.vid) << '|' << WtoA(r.pid) << '|' << WtoA(r.instanceId)
+          << '|' << WtoA(r.manufacturer) << '|' << WtoA(r.product) << '|' << WtoA(r.usbSerial)
+          << '|' << r.version << '|' << WtoA(r.fullName) << '\n';
     }
+}
+static std::wstring SplitAt(const std::wstring &line, size_t &pos)
+{
+    auto e = line.find(L'|', pos);
+    std::wstring tok = line.substr(pos, e == std::wstring::npos ? std::wstring::npos : e - pos);
+    pos = (e == std::wstring::npos) ? line.size() : e + 1;
+    return tok;
 }
 void LoadDB()
 {
     if (g_dbPath.empty())
         return;
-    std::string narrowPath(g_dbPath.begin(), g_dbPath.end());
-    std::ifstream f(narrowPath.c_str());
+    std::ifstream f(WtoA(g_dbPath).c_str());
     if (!f)
         return;
     std::string lineA;
     while (std::getline(f, lineA))
     {
+        if (lineA.size() < 3)
+            continue;
         std::wstring line(lineA.begin(), lineA.end());
-        if (line.size() < 5)
-            continue;
         wchar_t st = line[0];
-        auto p1 = line.find(L'|', 1);
-        if (p1 == std::wstring::npos)
-            continue;
-        auto p2 = line.find(L'|', p1 + 1);
-        if (p2 == std::wstring::npos)
-            continue;
-        auto p3 = line.find(L'|', p2 + 1);
-        if (p3 == std::wstring::npos)
-            continue;
-        auto p4 = line.find(L'|', p3 + 1);
-        if (p4 == std::wstring::npos)
-            continue;
+        size_t pos = 2;
         DevRecord r;
-        r.vid = line.substr(p1 + 1, p2 - p1 - 1);
-        r.pid = line.substr(p2 + 1, p3 - p2 - 1);
-        r.serial = line.substr(p3 + 1, p4 - p3 - 1);
-        r.fullName = line.substr(p4 + 1);
-        r.friendly = L"VID_" + r.vid + L"&PID_" + r.pid;
+        r.vid = SplitAt(line, pos);
+        r.pid = SplitAt(line, pos);
+        r.instanceId = SplitAt(line, pos);
+        r.manufacturer = (pos < line.size()) ? SplitAt(line, pos) : L"<unknown>";
+        r.product = (pos < line.size()) ? SplitAt(line, pos) : L"<unknown>";
+        r.usbSerial = (pos < line.size()) ? SplitAt(line, pos) : L"<none>";
+        if (pos < line.size())
+        {
+            std::wstring v = SplitAt(line, pos);
+            r.version = (USHORT)_wtoi(v.c_str());
+        }
+        if (pos < line.size())
+            r.fullName = SplitAt(line, pos);
+        r.friendly = (r.manufacturer != L"<unknown>" && r.product != L"<unknown>")
+                         ? r.manufacturer + L" " + r.product
+                     : (r.product != L"<unknown>") ? r.product
+                                                   : L"VID_" + r.vid + L"&PID_" + r.pid;
         if (st == L'A')
             r.status = DevRecord::Status::Allowed;
         else if (st == L'B')
             r.status = DevRecord::Status::Blocked;
-        g_db[L"VID_" + r.vid + L"&PID_" + r.pid + L"&SER_" + r.serial] = r;
+        g_db[L"VID_" + r.vid + L"&PID_" + r.pid + L"&INST_" + r.instanceId] = r;
     }
 }
 
@@ -473,7 +610,7 @@ void AppLog(const std::wstring &msg)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Refresh device list
+// Device list
 // ─────────────────────────────────────────────────────────────────────────────
 void RefreshDevList()
 {
@@ -485,30 +622,26 @@ void RefreshDevList()
     for (auto &kv : g_db)
     {
         auto &r = kv.second;
+        const wchar_t *stStr = (r.status == DevRecord::Status::Allowed) ? L"ALLOWED" : (r.status == DevRecord::Status::Blocked) ? L"BLOCKED"
+                                                                                                                                : L"unknown";
         LVITEMW lvi = {};
         lvi.mask = LVIF_TEXT;
         lvi.iItem = row;
-        const wchar_t *stStr = L"Unknown";
-        if (r.status == DevRecord::Status::Allowed)
-            stStr = L"ALLOWED";
-        if (r.status == DevRecord::Status::Blocked)
-            stStr = L"BLOCKED";
         lvi.iSubItem = 0;
         lvi.pszText = (LPWSTR)stStr;
         SendMessageW(g_hDevList, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
-        lvi.mask = LVIF_TEXT;
-        lvi.iSubItem = 1;
-        lvi.pszText = (LPWSTR)r.vid.c_str();
-        SendMessageW(g_hDevList, LVM_SETITEMW, 0, (LPARAM)&lvi);
-        lvi.iSubItem = 2;
-        lvi.pszText = (LPWSTR)r.pid.c_str();
-        SendMessageW(g_hDevList, LVM_SETITEMW, 0, (LPARAM)&lvi);
-        lvi.iSubItem = 3;
-        lvi.pszText = (LPWSTR)r.serial.c_str();
-        SendMessageW(g_hDevList, LVM_SETITEMW, 0, (LPARAM)&lvi);
-        lvi.iSubItem = 4;
-        lvi.pszText = (LPWSTR)r.friendly.c_str();
-        SendMessageW(g_hDevList, LVM_SETITEMW, 0, (LPARAM)&lvi);
+        auto setCol = [&](int col, const std::wstring &text)
+        {
+            lvi.iSubItem = col;
+            lvi.pszText = (LPWSTR)text.c_str();
+            SendMessageW(g_hDevList, LVM_SETITEMW, 0, (LPARAM)&lvi);
+        };
+        setCol(1, r.manufacturer);
+        setCol(2, r.product);
+        setCol(3, r.usbSerial);
+        setCol(4, r.vid);
+        setCol(5, r.pid);
+        setCol(6, r.instanceId);
         row++;
     }
 }
@@ -519,15 +652,14 @@ void RefreshDevList()
 void RebuildTrustFromDB()
 {
     g_trustedNames.clear();
-    g_trustedVIDs.clear();
+    g_trustedVIDPIDs.clear();
     for (auto &kv : g_db)
     {
-        auto &r = kv.second;
-        if (r.status == DevRecord::Status::Allowed)
+        if (kv.second.status == DevRecord::Status::Allowed)
         {
-            g_trustedNames.insert(r.fullName);
-            if (!r.vid.empty())
-                g_trustedVIDs.insert(r.vid);
+            g_trustedNames.insert(kv.second.fullName);
+            if (!kv.second.vid.empty() && !kv.second.pid.empty())
+                g_trustedVIDPIDs.insert(L"VID_" + kv.second.vid + L"&PID_" + kv.second.pid);
         }
     }
 }
@@ -550,20 +682,121 @@ bool IsTrusted(HANDLE h)
     std::wstring n = GetDevName(h);
     if (g_trustedNames.count(n))
         return true;
-    std::wstring vid = GetVID(n);
-    return !vid.empty() && g_trustedVIDs.count(vid);
+    std::wstring vid = GetVID(n), pid = GetPID(n);
+    if (!vid.empty() && !pid.empty())
+        return g_trustedVIDPIDs.count(L"VID_" + vid + L"&PID_" + pid) > 0;
+    return false;
 }
 void TrustDev(HANDLE h)
 {
-    std::wstring n = GetDevName(h), vid = GetVID(n);
+    std::wstring n = GetDevName(h), vid = GetVID(n), pid = GetPID(n);
     g_trusted.insert(h);
     g_trustedNames.insert(n);
-    if (!vid.empty())
-        g_trustedVIDs.insert(vid);
+    if (!vid.empty() && !pid.empty())
+        g_trustedVIDPIDs.insert(L"VID_" + vid + L"&PID_" + pid);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [SUGGEST B] Tray tooltip — shows queue depth when non-empty
+// ─────────────────────────────────────────────────────────────────────────────
+void UpdateTrayTooltip()
+{
+    if (!g_hTrayWnd)
+        return;
+    size_t queued;
+    {
+        std::lock_guard<std::mutex> lk(g_captchaQueueMtx);
+        queued = g_captchaQueue.size();
+    }
+    // +1 if a CAPTCHA is actively being shown
+    size_t total = queued + (g_captchaActive.load() ? 1 : 0);
+    if (total > 0)
+        swprintf_s(g_nid.szTip, L"USB Gatekeeper — %zu device(s) pending CAPTCHA", (size_t)total);
+    else
+        wcscpy_s(g_nid.szTip, L"USB Gatekeeper — Active");
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [FIX 2] CAPTCHA queue driver
+//
+// Called from:
+//   • ShowCaptcha()         — a new device needs a CAPTCHA
+//   • WM_NEXT_CAPTCHA       — a captcha thread just finished (any outcome)
+//
+// Invariant: g_captchaActive is only true while a CaptchaThread is running.
+// The thread always sets g_captchaActive=false then posts WM_NEXT_CAPTCHA before
+// it returns, so no device is ever left stuck in the queue.
+// ─────────────────────────────────────────────────────────────────────────────
+void ProcessCaptchaQueue()
+{
+    // Loop so we can skip queue entries whose device is no longer blocked
+    // (e.g. manually allowed or disconnected while waiting in queue).
+    while (true)
+    {
+        bool expected = false;
+        if (!g_captchaActive.compare_exchange_strong(expected, true))
+            return; // Another captcha is already showing; come back on WM_NEXT_CAPTCHA
+
+        CaptchaQueueItem next{};
+        bool found = false;
+
+        while (true)
+        {
+            {
+                std::lock_guard<std::mutex> lk(g_captchaQueueMtx);
+                if (g_captchaQueue.empty())
+                    break;
+                next = g_captchaQueue.front();
+                g_captchaQueue.pop_front();
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_devMutex);
+                if (g_blocked.count(next.dev))
+                {
+                    found = true;
+                    break;
+                }
+                // Device was allowed/disconnected while waiting — clean up pending
+                g_pending.erase(next.dev);
+            }
+        }
+
+        if (!found)
+        {
+            g_captchaActive = false;
+            UpdateTrayTooltip();
+            return;
+        }
+
+        g_chalDev = next.dev;
+        g_chalDC = next.dc;
+
+        HANDLE ht = CreateThread(NULL, 0, [](LPVOID) -> DWORD
+                                 {
+                // Defined below; forward-declared via function pointer trick.
+                // Actual body is CaptchaThread — redeclared at definition site.
+                extern DWORD WINAPI CaptchaThread(LPVOID);
+                return CaptchaThread(NULL); }, NULL, 0, NULL);
+
+        if (ht)
+        {
+            CloseHandle(ht);
+            UpdateTrayTooltip();
+            return;
+        }
+
+        // Thread creation failed — release the lock and try the next item
+        g_captchaActive = false;
+        AppLog(L"[ERROR] CaptchaThread creation failed");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Approve / Deny
+// NOTE: g_captchaActive is intentionally NOT cleared here.
+//       The captcha thread sets it to false and posts WM_NEXT_CAPTCHA just
+//       before it exits, so the queue always advances correctly.
 // ─────────────────────────────────────────────────────────────────────────────
 void ApproveDevice(HANDLE dev)
 {
@@ -579,7 +812,6 @@ void ApproveDevice(HANDLE dev)
             it = IsTrusted(*it) ? g_blocked.erase(it) : ++it;
         for (auto it = g_pending.begin(); it != g_pending.end();)
             it = IsTrusted(*it) ? g_pending.erase(it) : ++it;
-        // Clear ring buffer so no stale blocked-device handle lingers
         for (int i = 0; i < 4; i++)
             g_rawRing[i] = NULL;
     }
@@ -587,28 +819,39 @@ void ApproveDevice(HANDLE dev)
     AppLog(L"[APPROVED] " + ShortName(dev));
     g_chalDev = NULL;
     g_hCaptcha = NULL;
-    g_captchaActive = false;
-    RefreshDevList();
-}
-void DenyDevice(HANDLE dev)
-{
-    {
-        std::lock_guard<std::mutex> lk(g_devMutex);
-        g_pending.erase(dev);
-        DevRecord r = BuildRecord(dev);
-        r.status = DevRecord::Status::Blocked;
-        g_db[MakeDBKey(r.fullName)] = r;
-    }
-    SaveDB();
-    AppLog(L"[BLOCKED] " + ShortName(dev));
-    g_chalDev = NULL;
-    g_hCaptcha = NULL;
-    g_captchaActive = false;
     RefreshDevList();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Manual allow/block/forget from GUI
+// [SECURITY FIX 2] DenyDevice — session-only block, does NOT save to DB
+//
+// When a CAPTCHA is denied/timed out, the device is blocked for this session
+// but remains Status::Unknown in the database. On replug, the CAPTCHA will run
+// again. Only manual "Allow" via the GUI saves it as Status::Allowed.
+//
+// The "Remember-Blocked" setting now only applies to manual blocking via the GUI
+// button, not to CAPTCHA denial.
+// ─────────────────────────────────────────────────────────────────────────────
+void DenyDevice(HANDLE dev)
+{
+    if (!dev)
+        return; // [FIX 2] guard: device handle cleared externally (disconnect)
+    {
+        std::lock_guard<std::mutex> lk(g_devMutex);
+        g_pending.erase(dev);
+        g_blocked.insert(dev);
+        // [SECURITY FIX 2] Do NOT save to DB when denying CAPTCHA
+        // Device stays as Status::Unknown and will require CAPTCHA on replug
+    }
+    AppLog(L"[BLOCKED] " + ShortName(dev) + L" (session only — CAPTCHA required on replug)");
+    g_chalDev = NULL;
+    g_hCaptcha = NULL;
+    RefreshDevList();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Manual allow / block / forget
+// Uses WM_DISMISS_CAPTCHA for cross-thread-safe captcha closure.
 // ─────────────────────────────────────────────────────────────────────────────
 void ManualAllow(const std::wstring &dbKey)
 {
@@ -626,36 +869,37 @@ void ManualAllow(const std::wstring &dbKey)
         auto clearSets = [&](std::set<HANDLE> &s)
         {
             for (auto it2 = s.begin(); it2 != s.end();)
-            {
-                std::wstring dn = GetDevName(*it2);
-                bool match = (!vid.empty() && GetVID(dn) == vid && GetPID(dn) == pid);
-                it2 = match ? s.erase(it2) : ++it2;
-            }
+                it2 = (!vid.empty() && GetVID(GetDevName(*it2)) == vid && GetPID(GetDevName(*it2)) == pid)
+                          ? s.erase(it2)
+                          : ++it2;
         };
         clearSets(g_blocked);
         clearSets(g_pending);
-        // Clear ring buffer entries matching this device
         for (int i = 0; i < 4; i++)
             g_rawRing[i] = NULL;
+
+        // Close captcha if it's showing for this device
         if (g_chalDev)
         {
             std::wstring cn = GetDevName(g_chalDev);
             if (!vid.empty() && GetVID(cn) == vid && GetPID(cn) == pid)
             {
-                g_chalDev = NULL;
-                g_captchaActive = false;
+                g_chalDev = NULL; // clear before posting so DenyDevice gets NULL → no-op
                 if (g_hCaptcha)
                 {
-                    DestroyWindow(g_hCaptcha);
+                    PostMessageW(g_hCaptcha, WM_DISMISS_CAPTCHA, 0, 0);
                     g_hCaptcha = NULL;
                 }
+                // g_captchaActive is cleared by the captcha thread on exit;
+                // WM_NEXT_CAPTCHA will drive the queue forward automatically.
             }
         }
     }
     SaveDB();
-    AppLog(L"[MANUAL ALLOW] " + friendly + L" — device unblocked");
+    AppLog(L"[MANUAL ALLOW] " + friendly);
     RefreshDevList();
 }
+
 void ManualBlock(const std::wstring &dbKey)
 {
     std::wstring friendly, vid, pid;
@@ -669,7 +913,7 @@ void ManualBlock(const std::wstring &dbKey)
         vid = it->second.vid;
         pid = it->second.pid;
         RebuildTrustFromDB();
-        auto processHandles = [&](std::set<HANDLE> &handles)
+        auto processHandles = [&](const std::set<HANDLE> &handles)
         {
             for (HANDLE h : handles)
             {
@@ -682,15 +926,14 @@ void ManualBlock(const std::wstring &dbKey)
                 }
             }
         };
-        auto kbs = EnumByType(RIM_TYPEKEYBOARD);
-        auto mice = EnumByType(RIM_TYPEMOUSE);
-        processHandles(kbs);
-        processHandles(mice);
+        processHandles(EnumByType(RIM_TYPEKEYBOARD));
+        processHandles(EnumByType(RIM_TYPEMOUSE));
     }
     SaveDB();
-    AppLog(L"[MANUAL BLOCK] " + friendly + L" — device blocked");
+    AppLog(L"[MANUAL BLOCK] " + friendly);
     RefreshDevList();
 }
+
 void ManualForget(const std::wstring &dbKey)
 {
     std::wstring friendly, vid, pid;
@@ -707,23 +950,19 @@ void ManualForget(const std::wstring &dbKey)
         auto removeHandles = [&](std::set<HANDLE> &s)
         {
             for (auto hit = s.begin(); hit != s.end();)
-            {
-                std::wstring dn = GetDevName(*hit);
-                bool match = (!vid.empty() && GetVID(dn) == vid && GetPID(dn) == pid);
-                hit = match ? s.erase(hit) : ++hit;
-            }
+                hit = (!vid.empty() && GetVID(GetDevName(*hit)) == vid && GetPID(GetDevName(*hit)) == pid)
+                          ? s.erase(hit)
+                          : ++hit;
         };
         removeHandles(g_trusted);
         removeHandles(g_pending);
-        auto kbs = EnumByType(RIM_TYPEKEYBOARD);
-        auto mice = EnumByType(RIM_TYPEMOUSE);
-        for (HANDLE h : kbs)
+        for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
         {
             std::wstring dn = GetDevName(h);
             if (!vid.empty() && GetVID(dn) == vid && GetPID(dn) == pid)
                 g_blocked.insert(h);
         }
-        for (HANDLE h : mice)
+        for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
         {
             std::wstring dn = GetDevName(h);
             if (!vid.empty() && GetVID(dn) == vid && GetPID(dn) == pid)
@@ -731,9 +970,23 @@ void ManualForget(const std::wstring &dbKey)
         }
         for (int i = 0; i < 4; i++)
             g_rawRing[i] = NULL;
+
+        if (g_chalDev)
+        {
+            std::wstring cn = GetDevName(g_chalDev);
+            if (!vid.empty() && GetVID(cn) == vid && GetPID(cn) == pid)
+            {
+                g_chalDev = NULL;
+                if (g_hCaptcha)
+                {
+                    PostMessageW(g_hCaptcha, WM_DISMISS_CAPTCHA, 0, 0);
+                    g_hCaptcha = NULL;
+                }
+            }
+        }
     }
     SaveDB();
-    AppLog(L"[FORGOTTEN] " + friendly + L" — blocked now, CAPTCHA required on next plug-in");
+    AppLog(L"[FORGOTTEN] " + friendly + L" — CAPTCHA required on next plug-in");
     RefreshDevList();
 }
 
@@ -743,64 +996,151 @@ void ManualForget(const std::wstring &dbKey)
 LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
     static HBRUSH hBg = NULL, hEdit = NULL;
-    static HFONT hFB = NULL, hFM = NULL;
+    static HFONT hFontB = NULL, hFontM = NULL;
     static HBRUSH hBox[5] = {};
+
     auto Cleanup = [&]()
-    { if(hBg){DeleteObject(hBg);hBg=NULL;} if(hEdit){DeleteObject(hEdit);hEdit=NULL;} if(hFB){DeleteObject(hFB);hFB=NULL;} if(hFM){DeleteObject(hFM);hFM=NULL;} for(auto& b:hBox)if(b){DeleteObject(b);b=NULL;} };
+    {
+        if (hBg)
+        {
+            DeleteObject(hBg);
+            hBg = NULL;
+        }
+        if (hEdit)
+        {
+            DeleteObject(hEdit);
+            hEdit = NULL;
+        }
+        if (hFontB)
+        {
+            DeleteObject(hFontB);
+            hFontB = NULL;
+        }
+        if (hFontM)
+        {
+            DeleteObject(hFontM);
+            hFontM = NULL;
+        }
+        for (auto &b : hBox)
+            if (b)
+            {
+                DeleteObject(b);
+                b = NULL;
+            }
+    };
+
+    // [SUGGEST A] helper to (re)start the inactivity timer
+    auto ResetTimer = [&]()
+    {
+        if (CAPTCHA_TIMEOUT_MS > 0)
+        {
+            KillTimer(hw, CAPTCHA_TIMER_ID);
+            SetTimer(hw, CAPTCHA_TIMER_ID, CAPTCHA_TIMEOUT_MS, NULL);
+        }
+    };
+
     switch (msg)
     {
     case WM_CREATE:
     {
         hBg = CreateSolidBrush(RGB(18, 22, 40));
         hEdit = CreateSolidBrush(RGB(30, 35, 60));
-        hFB = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        hFM = CreateFontW(17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
-        HWND hIcon = CreateWindowExW(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE | SS_ICON, 16, 14, 32, 32, hw, (HMENU)200, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hIcon, STM_SETICON, (WPARAM)LoadIconW(NULL, IDI_WARNING), 0);
+        hFontB = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        hFontM = CreateFontW(17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+        HWND hIco = CreateWindowExW(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE | SS_ICON,
+                                    16, 14, 32, 32, hw, (HMENU)200, GetModuleHandleW(NULL), NULL);
+        SendMessageW(hIco, STM_SETICON, (WPARAM)LoadIconW(NULL, IDI_WARNING), 0);
         std::wstring title = (g_chalDC == DevClass::Mouse) ? L"New USB Mouse — Security Challenge" : L"New USB Keyboard — Security Challenge";
-        HWND hTitle = CreateWindowExW(0, L"STATIC", title.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT, 56, 16, 440, 22, hw, (HMENU)201, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hTitle, WM_SETFONT, (WPARAM)hFB, TRUE);
-        CreateWindowExW(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 12, 50, 480, 2, hw, (HMENU)202, GetModuleHandleW(NULL), NULL);
+        HWND hTitle = CreateWindowExW(0, L"STATIC", title.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                      56, 16, 440, 22, hw, (HMENU)201, GetModuleHandleW(NULL), NULL);
+        SendMessageW(hTitle, WM_SETFONT, (WPARAM)hFontB, TRUE);
+        CreateWindowExW(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+                        12, 50, 480, 2, hw, (HMENU)202, GetModuleHandleW(NULL), NULL);
         if (g_chalDC == DevClass::Mouse)
         {
-            HWND hP = CreateWindowExW(0, L"STATIC", g_chal.display.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTER, 12, 60, 480, 28, hw, (HMENU)IDC_LABEL, GetModuleHandleW(NULL), NULL);
-            SendMessageW(hP, WM_SETFONT, (WPARAM)hFB, TRUE);
-            CreateWindowExW(0, L"STATIC", L"3 attempts remaining", WS_CHILD | WS_VISIBLE | SS_CENTER, 12, 90, 480, 18, hw, (HMENU)IDC_SUBLABEL, GetModuleHandleW(NULL), NULL);
+            HWND hP = CreateWindowExW(0, L"STATIC", g_chal.display.c_str(),
+                                      WS_CHILD | WS_VISIBLE | SS_CENTER, 12, 60, 480, 28, hw,
+                                      (HMENU)IDC_LABEL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(hP, WM_SETFONT, (WPARAM)hFontB, TRUE);
+            CreateWindowExW(0, L"STATIC", L"3 attempts remaining", WS_CHILD | WS_VISIBLE | SS_CENTER,
+                            12, 90, 480, 18, hw, (HMENU)IDC_SUBLABEL, GetModuleHandleW(NULL), NULL);
             for (int i = 0; i < 5; i++)
             {
                 int ci = g_chal.boxColors[i];
                 hBox[i] = CreateSolidBrush(CVALS[ci]);
-                g_mouseBoxHwnd[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"BUTTON", CNAMES[ci], WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 12 + i * 92, 116, 86, 62, hw, (HMENU)(UINT_PTR)(IDC_T1 + i), GetModuleHandleW(NULL), NULL);
+                g_mouseBoxHwnd[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"BUTTON", CNAMES[ci],
+                                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                                    12 + i * 92, 116, 86, 62, hw,
+                                                    (HMENU)(UINT_PTR)(IDC_T1 + i),
+                                                    GetModuleHandleW(NULL), NULL);
             }
-            CreateWindowExW(0, L"BUTTON", L"Deny Access", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 185, 194, 120, 30, hw, (HMENU)IDC_DENY, GetModuleHandleW(NULL), NULL);
+            CreateWindowExW(0, L"BUTTON", L"Deny Access", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                            185, 194, 120, 30, hw, (HMENU)IDC_DENY, GetModuleHandleW(NULL), NULL);
         }
         else
         {
-            HWND hDisp = CreateWindowExW(0, L"STATIC", g_chal.display.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTER, 12, 60, 480, 52, hw, (HMENU)IDC_LABEL, GetModuleHandleW(NULL), NULL);
-            SendMessageW(hDisp, WM_SETFONT, (WPARAM)hFB, TRUE);
-            CreateWindowExW(0, L"STATIC", g_chal.hint.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTER, 12, 116, 480, 18, hw, (HMENU)IDC_SUBLABEL, GetModuleHandleW(NULL), NULL);
-            HWND hE = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL, 148, 142, 196, 28, hw, (HMENU)IDC_INPUT, GetModuleHandleW(NULL), NULL);
-            SendMessageW(hE, WM_SETFONT, (WPARAM)hFM, TRUE);
-            HWND hSub = CreateWindowExW(0, L"BUTTON", L"Submit", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 108, 182, 114, 32, hw, (HMENU)IDC_SUBMIT, GetModuleHandleW(NULL), NULL);
-            SendMessageW(hSub, WM_SETFONT, (WPARAM)hFB, TRUE);
-            CreateWindowExW(0, L"BUTTON", L"Deny Access", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 270, 182, 114, 32, hw, (HMENU)IDC_DENY, GetModuleHandleW(NULL), NULL);
+            HWND hDisp = CreateWindowExW(0, L"STATIC", g_chal.display.c_str(),
+                                         WS_CHILD | WS_VISIBLE | SS_CENTER, 12, 60, 480, 52, hw,
+                                         (HMENU)IDC_LABEL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(hDisp, WM_SETFONT, (WPARAM)hFontB, TRUE);
+            CreateWindowExW(0, L"STATIC", g_chal.hint.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTER,
+                            12, 116, 480, 18, hw, (HMENU)IDC_SUBLABEL, GetModuleHandleW(NULL), NULL);
+            HWND hE = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                      WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL,
+                                      148, 142, 196, 28, hw, (HMENU)IDC_INPUT,
+                                      GetModuleHandleW(NULL), NULL);
+            SendMessageW(hE, WM_SETFONT, (WPARAM)hFontM, TRUE);
+            HWND hSub = CreateWindowExW(0, L"BUTTON", L"Submit",
+                                        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                                        108, 182, 114, 32, hw, (HMENU)IDC_SUBMIT,
+                                        GetModuleHandleW(NULL), NULL);
+            SendMessageW(hSub, WM_SETFONT, (WPARAM)hFontB, TRUE);
+            CreateWindowExW(0, L"BUTTON", L"Deny Access", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                            270, 182, 114, 32, hw, (HMENU)IDC_DENY,
+                            GetModuleHandleW(NULL), NULL);
             SetFocus(GetDlgItem(hw, IDC_INPUT));
         }
         g_wrong = 0;
         g_timing.Reset();
+        ResetTimer(); // [SUGGEST A] start inactivity timer
         return 0;
     }
+
+    // [SUGGEST A] Inactivity timeout → auto-deny
+    case WM_TIMER:
+        if (wp == CAPTCHA_TIMER_ID)
+        {
+            KillTimer(hw, CAPTCHA_TIMER_ID);
+            AppLog(L"[AUTO-DENY] CAPTCHA timed out — device blocked");
+            SendMessageW(hw, WM_COMMAND, IDC_DENY, 0);
+        }
+        return 0;
+
+    // [FIX 2] Clean dismissal: device manually allowed/forgotten, or disconnected.
+    // Does NOT call DenyDevice; the captcha thread will handle g_captchaActive.
+    case WM_DISMISS_CAPTCHA:
+        KillTimer(hw, CAPTCHA_TIMER_ID);
+        Cleanup();
+        DestroyWindow(hw);
+        PostQuitMessage(0);
+        return 0;
+
     case WM_COMMAND:
     {
+        // [FIX 2] Capture g_chalDev immediately; it may be NULL'd from another thread.
+        HANDLE dev = g_chalDev;
         int id = LOWORD(wp);
+
         if (id == IDC_SUBMIT || id == IDOK)
         {
             wchar_t buf[128] = {};
             GetDlgItemTextW(hw, IDC_INPUT, buf, 127);
             std::wstring input(buf);
-            auto b = input.find_first_not_of(L" \t");
-            auto e = input.find_last_not_of(L" \t");
+            auto b = input.find_first_not_of(L" \t"), e = input.find_last_not_of(L" \t");
             input = (b == std::wstring::npos) ? L"" : input.substr(b, e - b + 1);
+
             if (!g_timing.IsHuman())
             {
                 g_wrong++;
@@ -808,16 +1148,19 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 MessageBeep(MB_ICONEXCLAMATION);
                 if (g_wrong >= MAX_WRONG)
                     goto deny;
-                SetDlgItemTextW(hw, IDC_SUBLABEL, (L"Robotic input! " + std::to_wstring(MAX_WRONG - g_wrong) + L" left").c_str());
+                SetDlgItemTextW(hw, IDC_SUBLABEL,
+                                (L"Robotic input! " + std::to_wstring(MAX_WRONG - g_wrong) + L" left").c_str());
                 g_chal = GenKBChallenge();
                 SetDlgItemTextW(hw, IDC_LABEL, g_chal.display.c_str());
                 SetDlgItemTextW(hw, IDC_INPUT, L"");
                 SetFocus(GetDlgItem(hw, IDC_INPUT));
+                ResetTimer(); // [SUGGEST A]
                 return 0;
             }
             if (WEqCI(input, g_chal.answer))
             {
-                ApproveDevice(g_chalDev);
+                KillTimer(hw, CAPTCHA_TIMER_ID);
+                ApproveDevice(dev);
                 Cleanup();
                 DestroyWindow(hw);
                 PostQuitMessage(0);
@@ -829,14 +1172,17 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 MessageBeep(MB_ICONEXCLAMATION);
                 if (g_wrong >= MAX_WRONG)
                 {
-                    MessageBoxW(hw, L"Max attempts. Device blocked.", L"Blocked", MB_OK | MB_ICONERROR | MB_TOPMOST);
+                    MessageBoxW(hw, L"Max attempts. Device blocked.", L"Blocked",
+                                MB_OK | MB_ICONERROR | MB_TOPMOST);
                     goto deny;
                 }
-                SetDlgItemTextW(hw, IDC_SUBLABEL, (L"Wrong. " + std::to_wstring(MAX_WRONG - g_wrong) + L" left").c_str());
+                SetDlgItemTextW(hw, IDC_SUBLABEL,
+                                (L"Wrong. " + std::to_wstring(MAX_WRONG - g_wrong) + L" left").c_str());
                 g_chal = GenKBChallenge();
                 SetDlgItemTextW(hw, IDC_LABEL, g_chal.display.c_str());
                 SetDlgItemTextW(hw, IDC_INPUT, L"");
                 SetFocus(GetDlgItem(hw, IDC_INPUT));
+                ResetTimer(); // [SUGGEST A]
             }
             return 0;
         }
@@ -845,7 +1191,8 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             int clicked = id - IDC_T1;
             if (clicked == g_chal.targetBox)
             {
-                ApproveDevice(g_chalDev);
+                KillTimer(hw, CAPTCHA_TIMER_ID);
+                ApproveDevice(dev);
                 Cleanup();
                 DestroyWindow(hw);
                 PostQuitMessage(0);
@@ -856,7 +1203,8 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 MessageBeep(MB_ICONEXCLAMATION);
                 if (g_wrong >= MAX_WRONG)
                     goto deny;
-                SetDlgItemTextW(hw, IDC_SUBLABEL, (L"Wrong box. " + std::to_wstring(MAX_WRONG - g_wrong) + L" left").c_str());
+                SetDlgItemTextW(hw, IDC_SUBLABEL,
+                                (L"Wrong box. " + std::to_wstring(MAX_WRONG - g_wrong) + L" left").c_str());
                 g_chal = GenMouseChallenge();
                 SetDlgItemTextW(hw, IDC_LABEL, g_chal.display.c_str());
                 for (int i = 0; i < 5; i++)
@@ -868,13 +1216,15 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                     hBox[i] = CreateSolidBrush(CVALS[ci]);
                     InvalidateRect(g_mouseBoxHwnd[i], NULL, TRUE);
                 }
+                ResetTimer(); // [SUGGEST A]
             }
             return 0;
         }
         if (id == IDC_DENY || id == IDCANCEL)
         {
         deny:
-            DenyDevice(g_chalDev);
+            KillTimer(hw, CAPTCHA_TIMER_ID);
+            DenyDevice(dev); // dev may be NULL → DenyDevice guards for that
             Cleanup();
             DestroyWindow(hw);
             PostQuitMessage(0);
@@ -882,12 +1232,13 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+
     case WM_KEYDOWN:
-    {
         if ((HWND)GetFocus() == GetDlgItem(hw, IDC_INPUT))
             g_timing.Add((double)GetTickCount64());
+        ResetTimer(); // [SUGGEST A] any keystroke resets the timeout
         return DefWindowProcW(hw, msg, wp, lp);
-    }
+
     case WM_CTLCOLORBTN:
     {
         HWND hC = (HWND)lp;
@@ -908,17 +1259,13 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         return 1;
     }
     case WM_CTLCOLORSTATIC:
-    {
         SetBkMode((HDC)wp, TRANSPARENT);
         SetTextColor((HDC)wp, RGB(200, 215, 255));
         return (LRESULT)hBg;
-    }
     case WM_CTLCOLOREDIT:
-    {
         SetBkColor((HDC)wp, RGB(30, 35, 60));
         SetTextColor((HDC)wp, RGB(220, 235, 255));
         return (LRESULT)hEdit;
-    }
     case WM_CLOSE:
         SendMessageW(hw, WM_COMMAND, IDC_DENY, 0);
         return 0;
@@ -931,15 +1278,15 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CAPTCHA thread
+// [FIX 2] On exit: always clears g_captchaActive and posts WM_NEXT_CAPTCHA so
+//         ProcessCaptchaQueue() advances to the next queued device.
 // ─────────────────────────────────────────────────────────────────────────────
 DWORD WINAPI CaptchaThread(LPVOID)
 {
     g_wrong = 0;
     g_timing.Reset();
-    if (g_chalDC == DevClass::Mouse)
-        g_chal = GenMouseChallenge();
-    else
-        g_chal = GenKBChallenge();
+    g_chal = (g_chalDC == DevClass::Mouse) ? GenMouseChallenge() : GenKBChallenge();
+
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     static bool regKB = false, regM = false;
     if (g_chalDC == DevClass::Mouse && !regM)
@@ -966,10 +1313,13 @@ DWORD WINAPI CaptchaThread(LPVOID)
     }
     const wchar_t *cls = (g_chalDC == DevClass::Mouse) ? L"CaptchaMouse" : L"CaptchaKeyboard";
     int w = 510, h = (g_chalDC == DevClass::Mouse ? 244 : 270);
-    g_hCaptcha = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, cls, L"USB Gatekeeper", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, (sw - w) / 2, (sh - h) / 2, w, h, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    g_hCaptcha = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, cls, L"USB Gatekeeper",
+                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                                 (sw - w) / 2, (sh - h) / 2, w, h, NULL, NULL, GetModuleHandleW(NULL), NULL);
     ShowWindow(g_hCaptcha, SW_SHOWNORMAL);
     UpdateWindow(g_hCaptcha);
     SetForegroundWindow(g_hCaptcha);
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
     {
@@ -979,64 +1329,56 @@ DWORD WINAPI CaptchaThread(LPVOID)
             DispatchMessageW(&msg);
         }
     }
+
+    // [FIX 2] Always release the active flag and drive the queue forward.
     g_captchaActive = false;
+    PostMessageW(g_hMsgWnd, WM_NEXT_CAPTCHA, 0, 0);
     return 0;
-}
-void ShowCaptcha(HANDLE hDev, DevClass dc)
-{
-    bool expected = false;
-    if (!g_captchaActive.compare_exchange_strong(expected, true))
-        return;
-    if (g_pending.count(hDev))
-    {
-        g_captchaActive = false;
-        return;
-    }
-    g_chalDev = hDev;
-    g_chalDC = dc;
-    {
-        std::lock_guard<std::mutex> lk(g_devMutex);
-        g_pending.insert(hDev);
-    }
-    HANDLE ht = CreateThread(NULL, 0, CaptchaThread, hDev, 0, NULL);
-    if (ht)
-        CloseHandle(ht);
-    else
-        g_captchaActive = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hook — THREE layers of protection
-//
-//  1. LLKHF_INJECTED: block software injection (AutoHotkey/SendInput) always
-//  2. Captcha active: block ALL keys not directed at the captcha window
-//  3. Ring buffer:    block keys from any recently-seen blocked physical device
+// [FIX 2] ShowCaptcha — enqueues the device; ProcessCaptchaQueue shows it when
+//         the current CAPTCHA (if any) is resolved.
+// ─────────────────────────────────────────────────────────────────────────────
+void ShowCaptcha(HANDLE hDev, DevClass dc)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_devMutex);
+        if (g_pending.count(hDev))
+            return; // already queued or active
+        g_pending.insert(hDev);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_captchaQueueMtx);
+        g_captchaQueue.push_back({hDev, dc});
+    }
+    UpdateTrayTooltip();
+    ProcessCaptchaQueue();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Low-level keyboard hook (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK LowLevelKBProc(int nCode, WPARAM wp, LPARAM lp)
 {
     if (nCode == HC_ACTION)
     {
         auto *kb = reinterpret_cast<KBDLLHOOKSTRUCT *>(lp);
-
-        // Layer 1: software injection — block always
+        // Layer 1: block software injection
         if (kb->flags & LLKHF_INJECTED)
         {
             wchar_t kn[32] = L"?";
             UINT sc = MapVirtualKeyW(kb->vkCode, MAPVK_VK_TO_VSC);
             GetKeyNameTextW((LONG)(sc << 16), kn, 32);
-            {
-                std::wostringstream _s;
-                _s << std::hex << std::uppercase << kb->vkCode;
-                AppLog(L"[BLOCKED] Injection: VK=0x" + _s.str() + L" (" + kn + L")");
-            }
+            std::wostringstream _s;
+            _s << std::hex << std::uppercase << kb->vkCode;
+            AppLog(L"[BLOCKED] Injection: VK=0x" + _s.str() + L" (" + kn + L")");
             return 1;
         }
-
-        // Layer 2: captcha active for a keyboard — block all keys outside captcha window
+        // Layer 2: block keys outside captcha during active challenge
         if (g_captchaActive && g_chalDC == DevClass::Keyboard && g_hCaptcha)
         {
-            HWND fg = GetForegroundWindow();
-            if (fg != g_hCaptcha)
+            if (GetForegroundWindow() != g_hCaptcha)
             {
                 wchar_t kn[32] = L"?";
                 UINT sc = MapVirtualKeyW(kb->vkCode, MAPVK_VK_TO_VSC);
@@ -1045,8 +1387,7 @@ LRESULT CALLBACK LowLevelKBProc(int nCode, WPARAM wp, LPARAM lp)
                 return 1;
             }
         }
-
-        // Layer 3: ring buffer — if any recent raw device is in g_blocked, block key
+        // Layer 3: ring buffer — block keys from blocked device
         {
             std::lock_guard<std::mutex> lk(g_devMutex);
             if (!g_blocked.empty())
@@ -1069,7 +1410,57 @@ LRESULT CALLBACK LowLevelKBProc(int nCode, WPARAM wp, LPARAM lp)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main GUI window
+// Layout (unchanged)
+// ─────────────────────────────────────────────────────────────────────────────
+static void LayoutMainWindow(int W, int H)
+{
+    const int PAD = 8, LABEL_H = 16, BTN_H = 28, BTN_W = 130, CHK_H = 20, CHK_W = 200;
+    int y = PAD;
+    if (g_hStaticLog)
+        SetWindowPos(g_hStaticLog, NULL, PAD, y, W - PAD * 2, LABEL_H, SWP_NOZORDER);
+    y += LABEL_H + 2;
+    int logH = g_logHeight;
+    if (logH < 40)
+        logH = 40;
+    if (logH > H - 280)
+        logH = H - 280;
+    if (g_hLog)
+        SetWindowPos(g_hLog, NULL, PAD, y, W - PAD * 2, logH, SWP_NOZORDER);
+    y += logH;
+    g_splitterTopY = y;
+    y += SPLITTER_H + 4;
+    if (g_hStaticSettings)
+        SetWindowPos(g_hStaticSettings, NULL, PAD, y, W - PAD * 2, LABEL_H, SWP_NOZORDER);
+    y += LABEL_H + 2;
+    if (g_hChkAllowList)
+        SetWindowPos(g_hChkAllowList, NULL, PAD, y, CHK_W, CHK_H, SWP_NOZORDER);
+    if (g_hChkRemBlocked)
+        SetWindowPos(g_hChkRemBlocked, NULL, PAD + CHK_W + 8, y, CHK_W, CHK_H, SWP_NOZORDER);
+    y += CHK_H + PAD;
+    if (g_hStaticDev)
+        SetWindowPos(g_hStaticDev, NULL, PAD, y, W - PAD * 2, LABEL_H, SWP_NOZORDER);
+    y += LABEL_H + 2;
+    int listBottom = H - PAD - BTN_H - PAD;
+    int listH = listBottom - y;
+    if (listH < 60)
+        listH = 60;
+    if (g_hDevList)
+        SetWindowPos(g_hDevList, NULL, PAD, y, W - PAD * 2, listH, SWP_NOZORDER);
+    y = listBottom + PAD;
+    if (g_hBtnAllow)
+        SetWindowPos(g_hBtnAllow, NULL, PAD + (BTN_W + PAD) * 0, y, BTN_W, BTN_H, SWP_NOZORDER);
+    if (g_hBtnBlock)
+        SetWindowPos(g_hBtnBlock, NULL, PAD + (BTN_W + PAD) * 1, y, BTN_W, BTN_H, SWP_NOZORDER);
+    if (g_hBtnClear)
+        SetWindowPos(g_hBtnClear, NULL, PAD + (BTN_W + PAD) * 2, y, BTN_W, BTN_H, SWP_NOZORDER);
+    if (g_hBtnForget)
+        SetWindowPos(g_hBtnForget, NULL, PAD + (BTN_W + PAD) * 3, y, BTN_W, BTN_H, SWP_NOZORDER);
+    if (g_hBtnRefresh)
+        SetWindowPos(g_hBtnRefresh, NULL, PAD + (BTN_W + PAD) * 4, y, BTN_W, BTN_H, SWP_NOZORDER);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main GUI window proc (unchanged except WM_SIZE repaints the splitter)
 // ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -1077,46 +1468,158 @@ LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_CREATE:
     {
-        HFONT hF = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HWND hsl = CreateWindowExW(0, L"STATIC", L"Event Log", WS_CHILD | WS_VISIBLE, 8, 8, 200, 16, hw, (HMENU)IDC_STATIC_LOG, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hsl, WM_SETFONT, (WPARAM)hF, TRUE);
-        HWND hsd = CreateWindowExW(0, L"STATIC", L"Device Database (VID / PID / Serial / Name)", WS_CHILD | WS_VISIBLE, 8, 228, 500, 16, hw, (HMENU)IDC_STATIC_DEV, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hsd, WM_SETFONT, (WPARAM)hF, TRUE);
-        g_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOSEL | LBS_NOINTEGRALHEIGHT, 8, 26, 784, 194, hw, (HMENU)IDC_LOG, GetModuleHandleW(NULL), NULL);
+        HFONT hF = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                               CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        auto mkStatic = [&](const wchar_t *txt, HMENU id) -> HWND
+        {
+            HWND h=CreateWindowExW(0,L"STATIC",txt,WS_CHILD|WS_VISIBLE,0,0,0,0,hw,id,GetModuleHandleW(NULL),NULL);
+            SendMessageW(h,WM_SETFONT,(WPARAM)hF,TRUE); return h; };
+        auto mkChk = [&](const wchar_t *txt, HMENU id) -> HWND
+        {
+            HWND h=CreateWindowExW(0,L"BUTTON",txt,WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,0,0,0,hw,id,GetModuleHandleW(NULL),NULL);
+            SendMessageW(h,WM_SETFONT,(WPARAM)hF,TRUE); return h; };
+        auto mkBtn = [&](const wchar_t *txt, HMENU id) -> HWND
+        {
+            HWND h=CreateWindowExW(0,L"BUTTON",txt,WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,0,0,0,0,hw,id,GetModuleHandleW(NULL),NULL);
+            SendMessageW(h,WM_SETFONT,(WPARAM)hF,TRUE); return h; };
+
+        g_hStaticLog = mkStatic(L"Event Log", (HMENU)IDC_STATIC_LOG);
+        g_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOSEL | LBS_NOINTEGRALHEIGHT,
+                                 0, 0, 0, 0, hw, (HMENU)IDC_LOG, GetModuleHandleW(NULL), NULL);
         SendMessageW(g_hLog, WM_SETFONT, (WPARAM)hF, TRUE);
-        g_hDevList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, NULL, WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 8, 248, 784, 230, hw, (HMENU)IDC_DEVLIST, GetModuleHandleW(NULL), NULL);
+
+        g_hStaticSettings = mkStatic(L"Settings", (HMENU)IDC_STATIC_SETTINGS);
+        g_hChkAllowList = mkChk(L"Allow-Listing (skip CAPTCHA for trusted devices)", (HMENU)IDC_CHK_ALLOWLIST);
+        g_hChkRemBlocked = mkChk(L"Remember-Blocked (persist blocked devices)", (HMENU)IDC_CHK_REMBLOCKED);
+        SendMessageW(g_hChkAllowList, BM_SETCHECK, g_allowListingEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(g_hChkRemBlocked, BM_SETCHECK, g_rememberBlockedEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        g_hStaticDev = mkStatic(
+            L"Known Devices  (Status / Manufacturer / Product / USB Serial / VID / PID / Instance)",
+            (HMENU)IDC_STATIC_DEV);
+        g_hDevList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, NULL,
+                                     WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                     0, 0, 0, 0, hw, (HMENU)IDC_DEVLIST, GetModuleHandleW(NULL), NULL);
         SendMessageW(g_hDevList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
         SendMessageW(g_hDevList, WM_SETFONT, (WPARAM)hF, TRUE);
-        LVCOLUMNW col = {};
-        col.mask = LVCF_TEXT | LVCF_WIDTH;
-        col.cx = 80;
-        col.pszText = (LPWSTR)L"Status";
-        SendMessageW(g_hDevList, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
-        col.cx = 70;
-        col.pszText = (LPWSTR)L"VID";
-        SendMessageW(g_hDevList, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
-        col.cx = 70;
-        col.pszText = (LPWSTR)L"PID";
-        SendMessageW(g_hDevList, LVM_INSERTCOLUMNW, 2, (LPARAM)&col);
-        col.cx = 160;
-        col.pszText = (LPWSTR)L"Serial";
-        SendMessageW(g_hDevList, LVM_INSERTCOLUMNW, 3, (LPARAM)&col);
-        col.cx = 380;
-        col.pszText = (LPWSTR)L"Device";
-        SendMessageW(g_hDevList, LVM_INSERTCOLUMNW, 4, (LPARAM)&col);
-        HWND hBA = CreateWindowExW(0, L"BUTTON", L"Allow Selected", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 8, 486, 130, 28, hw, (HMENU)IDC_BTN_ALLOW, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hBA, WM_SETFONT, (WPARAM)hF, TRUE);
-        HWND hBB = CreateWindowExW(0, L"BUTTON", L"Block Selected", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 146, 486, 130, 28, hw, (HMENU)IDC_BTN_BLOCK, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hBB, WM_SETFONT, (WPARAM)hF, TRUE);
-        HWND hBC = CreateWindowExW(0, L"BUTTON", L"Clear Log", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 284, 486, 100, 28, hw, (HMENU)IDC_BTN_CLEAR, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hBC, WM_SETFONT, (WPARAM)hF, TRUE);
-        HWND hBF = CreateWindowExW(0, L"BUTTON", L"Forget Device", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 392, 486, 130, 28, hw, (HMENU)IDC_BTN_FORGET, GetModuleHandleW(NULL), NULL);
-        SendMessageW(hBF, WM_SETFONT, (WPARAM)hF, TRUE);
+        struct
+        {
+            const wchar_t *name;
+            int cx;
+        } cols[] = {
+            {L"Status", 80}, {L"Manufacturer", 130}, {L"Product", 160}, {L"USB Serial", 110}, {L"VID", 60}, {L"PID", 60}, {L"Instance", 140}};
+        for (int i = 0; i < 7; i++)
+        {
+            LVCOLUMNW col = {};
+            col.mask = LVCF_TEXT | LVCF_WIDTH;
+            col.cx = cols[i].cx;
+            col.pszText = (LPWSTR)cols[i].name;
+            SendMessageW(g_hDevList, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
+        }
+        g_hBtnAllow = mkBtn(L"Allow Selected", (HMENU)IDC_BTN_ALLOW);
+        g_hBtnBlock = mkBtn(L"Block Selected", (HMENU)IDC_BTN_BLOCK);
+        g_hBtnClear = mkBtn(L"Clear Log", (HMENU)IDC_BTN_CLEAR);
+        g_hBtnForget = mkBtn(L"Forget Device", (HMENU)IDC_BTN_FORGET);
+        g_hBtnRefresh = mkBtn(L"Refresh Devices", (HMENU)IDC_BTN_REFRESH);
+        RECT rc;
+        GetClientRect(hw, &rc);
+        LayoutMainWindow(rc.right, rc.bottom);
+        return 0;
+    }
+    case WM_SIZE:
+        LayoutMainWindow(LOWORD(lp), HIWORD(lp));
+        InvalidateRect(hw, NULL, FALSE);
+        return 0;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        BeginPaint(hw, &ps);
+        RECT sr = {0, g_splitterTopY, ps.rcPaint.right, g_splitterTopY + SPLITTER_H};
+        FillRect(ps.hdc, &sr, (HBRUSH)(COLOR_BTNFACE + 1));
+        HPEN hpD = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNSHADOW));
+        HPEN hpL = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNHIGHLIGHT));
+        HPEN old = (HPEN)SelectObject(ps.hdc, hpD);
+        MoveToEx(ps.hdc, 0, g_splitterTopY + 1, NULL);
+        LineTo(ps.hdc, ps.rcPaint.right, g_splitterTopY + 1);
+        SelectObject(ps.hdc, hpL);
+        MoveToEx(ps.hdc, 0, g_splitterTopY + 3, NULL);
+        LineTo(ps.hdc, ps.rcPaint.right, g_splitterTopY + 3);
+        SelectObject(ps.hdc, old);
+        DeleteObject(hpD);
+        DeleteObject(hpL);
+        EndPaint(hw, &ps);
+        return 0;
+    }
+    case WM_SETCURSOR:
+    {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hw, &pt);
+        if (pt.y >= g_splitterTopY && pt.y < g_splitterTopY + SPLITTER_H)
+        {
+            SetCursor(LoadCursorW(NULL, IDC_SIZENS));
+            return TRUE;
+        }
+        return DefWindowProcW(hw, msg, wp, lp);
+    }
+    case WM_LBUTTONDOWN:
+    {
+        int y = (short)HIWORD(lp);
+        if (y >= g_splitterTopY && y < g_splitterTopY + SPLITTER_H)
+        {
+            g_splitterDrag = true;
+            g_dragBaseY = y;
+            g_dragBaseLogH = g_logHeight;
+            SetCapture(hw);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (g_splitterDrag)
+        {
+            int y = (short)HIWORD(lp);
+            int nh = g_dragBaseLogH + (y - g_dragBaseY);
+            if (nh < 40)
+                nh = 40;
+            if (nh > 600)
+                nh = 600;
+            g_logHeight = nh;
+            RECT rc;
+            GetClientRect(hw, &rc);
+            LayoutMainWindow(rc.right, rc.bottom);
+            InvalidateRect(hw, NULL, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (g_splitterDrag)
+        {
+            g_splitterDrag = false;
+            ReleaseCapture();
+        }
+        return 0;
+    case WM_GETMINMAXINFO:
+    {
+        auto *mmi = reinterpret_cast<MINMAXINFO *>(lp);
+        mmi->ptMinTrackSize.x = 740;
+        mmi->ptMinTrackSize.y = 500;
         return 0;
     }
     case WM_COMMAND:
     {
         int id = LOWORD(wp);
+        if (id == IDC_CHK_ALLOWLIST)
+        {
+            g_allowListingEnabled = (SendMessageW(g_hChkAllowList, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            AppLog(g_allowListingEnabled ? L"[SETTING] Allow-Listing ENABLED" : L"[SETTING] Allow-Listing DISABLED");
+            return 0;
+        }
+        if (id == IDC_CHK_REMBLOCKED)
+        {
+            g_rememberBlockedEnabled = (SendMessageW(g_hChkRemBlocked, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            AppLog(g_rememberBlockedEnabled ? L"[SETTING] Remember-Blocked ENABLED" : L"[SETTING] Remember-Blocked DISABLED");
+            return 0;
+        }
         if (id == IDC_BTN_ALLOW || id == IDC_BTN_BLOCK)
         {
             int sel = (int)SendMessageW(g_hDevList, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
@@ -1125,30 +1628,29 @@ LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 MessageBoxW(hw, L"Select a device first.", L"No Selection", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
-            int row = 0;
-            std::wstring targetName;
+            std::wstring key;
             {
                 std::lock_guard<std::mutex> lk(g_devMutex);
+                int row = 0;
                 for (auto &kv : g_db)
                 {
                     if (row == sel)
                     {
-                        targetName = kv.first;
+                        key = kv.first;
                         break;
                     }
                     row++;
                 }
             }
-            if (targetName.empty())
+            if (key.empty())
                 return 0;
-            if (id == IDC_BTN_ALLOW)
-                ManualAllow(targetName);
-            else
-                ManualBlock(targetName);
+            (id == IDC_BTN_ALLOW) ? ManualAllow(key) : ManualBlock(key);
+            return 0;
         }
         if (id == IDC_BTN_CLEAR)
         {
             SendMessageW(g_hLog, LB_RESETCONTENT, 0, 0);
+            return 0;
         }
         if (id == IDC_BTN_FORGET)
         {
@@ -1158,35 +1660,55 @@ LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 MessageBoxW(hw, L"Select a device first.", L"No Selection", MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
-            int row = 0;
-            std::wstring targetKey;
+            std::wstring key;
             {
                 std::lock_guard<std::mutex> lk(g_devMutex);
+                int row = 0;
                 for (auto &kv : g_db)
                 {
                     if (row == sel)
                     {
-                        targetKey = kv.first;
+                        key = kv.first;
                         break;
                     }
                     row++;
                 }
             }
-            if (targetKey.empty())
+            if (key.empty())
                 return 0;
-            if (MessageBoxW(hw, L"Forget this device? It will be treated as brand new on next plug-in and require a fresh CAPTCHA.", L"Confirm Forget", MB_YESNO | MB_ICONQUESTION) != IDYES)
+            if (MessageBoxW(hw, L"Forget this device? A fresh CAPTCHA will be required on next plug-in.",
+                            L"Confirm Forget", MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return 0;
-            ManualForget(targetKey);
+            ManualForget(key);
+            return 0;
         }
-        return 0;
-    }
-    case WM_SIZE:
-    {
-        int W = LOWORD(lp), H = HIWORD(lp);
-        if (g_hLog)
-            SetWindowPos(g_hLog, NULL, 8, 26, W - 16, 194, SWP_NOZORDER);
-        if (g_hDevList)
-            SetWindowPos(g_hDevList, NULL, 8, 248, W - 16, H - 290, SWP_NOZORDER);
+        if (id == IDC_BTN_REFRESH)
+        {
+            {
+                std::lock_guard<std::mutex> lk(g_devMutex);
+                auto rescan = [&](HANDLE h)
+                {
+                    DevRecord fresh = BuildRecord(h);
+                    auto it = g_db.find(MakeDBKey(fresh.fullName));
+                    if (it != g_db.end())
+                    {
+                        it->second.manufacturer = fresh.manufacturer;
+                        it->second.product = fresh.product;
+                        it->second.usbSerial = fresh.usbSerial;
+                        it->second.version = fresh.version;
+                        it->second.friendly = fresh.friendly;
+                    }
+                };
+                for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
+                    rescan(h);
+                for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
+                    rescan(h);
+            }
+            SaveDB();
+            RefreshDevList();
+            AppLog(L"[INFO] Device list refreshed");
+            return 0;
+        }
         return 0;
     }
     case WM_CLOSE:
@@ -1200,12 +1722,17 @@ LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Background message window (WM_INPUT + WM_DEVICECHANGE)
+// Background message window — WM_INPUT + WM_DEVICECHANGE
 // ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
+    // [FIX 2] Drive the CAPTCHA queue after each captcha thread exits.
+    case WM_NEXT_CAPTCHA:
+        ProcessCaptchaQueue();
+        return 0;
+
     case WM_INPUT:
     {
         UINT sz = 0;
@@ -1222,74 +1749,88 @@ LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
         return DefWindowProcW(hWnd, uMsg, wParam, lParam);
     }
+
     case WM_DEVICECHANGE:
     {
         if (wParam == DBT_DEVICEARRIVAL)
         {
             auto *hdr = reinterpret_cast<DEV_BROADCAST_HDR *>(lParam);
-            if (hdr && hdr->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE)
+            if (!hdr || hdr->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
+                break;
+
+            // [FIX 1] Extract the identity of the device that just arrived.
+            auto *devIface = reinterpret_cast<DEV_BROADCAST_DEVICEINTERFACE *>(lParam);
+            DevKey arrivedKey = ExtractDevKey(devIface->dbcc_name);
+
+            Sleep(400); // let Windows finish registering the device
+
+            HANDLE newDev = NULL;
+            DevClass dc = DevClass::Unknown;
+
+            // tryDevice: match by DevKey first (FIX 1), then apply flowchart logic
+            auto tryDevice = [&](HANDLE h, DevClass devCls) -> bool
             {
-                Sleep(300);
-                HANDLE newDev = NULL;
-                DevClass dc = DevClass::Unknown;
-                auto kbs = EnumByType(RIM_TYPEKEYBOARD);
+                // [FIX 1] Only consider handles that match the arrived device.
+                // Falls back to VID+PID if instance extraction failed.
+                std::wstring hn = GetDevName(h);
+                if (!DevKeyMatch(arrivedKey, ExtractDevKey(hn)))
+                    return false;
+
+                std::lock_guard<std::mutex> lk(g_devMutex);
+                if (IsTrusted(h) || g_blocked.count(h) || g_pending.count(h))
+                    return false;
+
+                DevRecord r = BuildRecord(h);
+                std::wstring dbk = MakeDBKey(r.fullName);
+                auto dbSt = DBStatus(h);
+
+                // Step 1 — Allow-Listing
+                if (g_allowListingEnabled && dbSt == DevRecord::Status::Allowed)
                 {
-                    std::lock_guard<std::mutex> lk(g_devMutex);
-                    for (HANDLE h : kbs)
+                    TrustDev(h);
+                    r.status = DevRecord::Status::Allowed;
+                    g_db[dbk] = r;
+                    AppLog(L"[ALLOW-LIST] Auto-trusted: " + r.friendly +
+                           L"  (use 'Forget' to require CAPTCHA on replug)");
+                    return false;
+                }
+                // Step 2 — Remember-Blocked
+                if (g_rememberBlockedEnabled && dbSt == DevRecord::Status::Blocked)
+                {
+                    g_blocked.insert(h);
+                    AppLog(L"[SILENTLY BLOCKED] Previously blocked: " + r.friendly);
+                    return false;
+                }
+                // Step 3 — CAPTCHA required
+                g_blocked.insert(h);
+                if (!g_db.count(dbk))
+                    g_db[dbk] = r;
+                newDev = h;
+                dc = devCls;
+                AppLog(L"[ALERT] New " + std::wstring(devCls == DevClass::Keyboard ? L"keyboard" : L"mouse") +
+                       L" — CAPTCHA required: " + r.friendly);
+                return true;
+            };
+
+            bool needCaptcha = false;
+            for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
+                if (tryDevice(h, DevClass::Keyboard))
+                {
+                    needCaptcha = true;
+                    break;
+                }
+            if (!needCaptcha)
+                for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
+                    if (tryDevice(h, DevClass::Mouse))
                     {
-                        if (IsTrusted(h) || g_blocked.count(h) || g_pending.count(h))
-                            continue;
-                        auto st = DBStatus(h);
-                        if (st == DevRecord::Status::Blocked)
-                        {
-                            g_blocked.insert(h);
-                            AppLog(L"[SILENTLY BLOCKED] " + ShortName(h));
-                            continue;
-                        }
-                        g_blocked.insert(h);
-                        newDev = h;
-                        dc = DevClass::Keyboard;
-                        AppLog(L"[ALERT] New keyboard: " + ShortName(h));
+                        needCaptcha = true;
                         break;
                     }
-                }
-                if (!newDev)
-                {
-                    auto mice = EnumByType(RIM_TYPEMOUSE);
-                    std::lock_guard<std::mutex> lk(g_devMutex);
-                    for (HANDLE h : mice)
-                    {
-                        if (IsTrusted(h) || g_blocked.count(h) || g_pending.count(h))
-                            continue;
-                        auto st = DBStatus(h);
-                        if (st == DevRecord::Status::Blocked)
-                        {
-                            g_blocked.insert(h);
-                            AppLog(L"[SILENTLY BLOCKED] " + ShortName(h));
-                            continue;
-                        }
-                        newDev = h;
-                        dc = DevClass::Mouse;
-                        AppLog(L"[ALERT] New mouse: " + ShortName(h));
-                        break;
-                    }
-                }
-                if (newDev)
-                {
-                    {
-                        std::lock_guard<std::mutex> lk(g_devMutex);
-                        DevRecord r = BuildRecord(newDev);
-                        std::wstring dbk = MakeDBKey(r.fullName);
-                        if (!g_db.count(dbk))
-                        {
-                            g_db[dbk] = r;
-                        }
-                    }
-                    SaveDB();
-                    RefreshDevList();
-                    ShowCaptcha(newDev, dc);
-                }
-            }
+
+            SaveDB();
+            RefreshDevList();
+            if (needCaptcha)
+                ShowCaptcha(newDev, dc);
         }
         else if (wParam == DBT_DEVICEREMOVECOMPLETE)
         {
@@ -1298,20 +1839,35 @@ LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             std::set<HANDLE> all;
             all.insert(kbs.begin(), kbs.end());
             all.insert(mice.begin(), mice.end());
-            std::lock_guard<std::mutex> lk(g_devMutex);
-            for (auto it = g_blocked.begin(); it != g_blocked.end();)
-                it = all.count(*it) ? ++it : g_blocked.erase(it);
-            for (auto it = g_pending.begin(); it != g_pending.end();)
-                it = all.count(*it) ? ++it : g_pending.erase(it);
-            if (g_chalDev && !all.count(g_chalDev))
             {
-                if (g_hCaptcha)
+                std::lock_guard<std::mutex> lk(g_devMutex);
+                for (auto it = g_blocked.begin(); it != g_blocked.end();)
+                    it = all.count(*it) ? ++it : g_blocked.erase(it);
+                for (auto it = g_pending.begin(); it != g_pending.end();)
+                    it = all.count(*it) ? ++it : g_pending.erase(it);
+
+                // [FIX 2] If the device being challenged was removed, dismiss cleanly.
+                // WM_DISMISS_CAPTCHA → captcha thread exits → sets g_captchaActive=false
+                // → posts WM_NEXT_CAPTCHA → queue advances normally.
+                if (g_chalDev && !all.count(g_chalDev))
                 {
-                    DestroyWindow(g_hCaptcha);
-                    g_hCaptcha = NULL;
+                    g_chalDev = NULL; // NULL before posting so DenyDevice sees NULL → no-op
+                    if (g_hCaptcha)
+                    {
+                        PostMessageW(g_hCaptcha, WM_DISMISS_CAPTCHA, 0, 0);
+                        g_hCaptcha = NULL;
+                    }
                 }
-                g_chalDev = NULL;
-                g_captchaActive = false;
+            }
+
+            // Also remove any queued items for disconnected devices
+            {
+                std::lock_guard<std::mutex> lk(g_captchaQueueMtx);
+                g_captchaQueue.erase(
+                    std::remove_if(g_captchaQueue.begin(), g_captchaQueue.end(),
+                                   [&](const CaptchaQueueItem &item)
+                                   { return !all.count(item.dev); }),
+                    g_captchaQueue.end());
             }
         }
         return TRUE;
@@ -1326,10 +1882,6 @@ LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 // ─────────────────────────────────────────────────────────────────────────────
 // System tray
 // ─────────────────────────────────────────────────────────────────────────────
-#define WM_TRAYICON (WM_USER + 1)
-#define IDI_TRAY 1
-NOTIFYICONDATAW g_nid = {};
-
 void AddTrayIcon(HWND hw)
 {
     g_nid.cbSize = sizeof(g_nid);
@@ -1345,14 +1897,11 @@ void RemoveTrayIcon() { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
 
 LRESULT CALLBACK TrayWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (msg == WM_TRAYICON)
+    if (msg == WM_TRAYICON && (lp == WM_LBUTTONDBLCLK || lp == WM_RBUTTONUP))
     {
-        if (lp == WM_LBUTTONDBLCLK || lp == WM_RBUTTONUP)
-        {
-            ShowWindow(g_hWnd, IsWindowVisible(g_hWnd) ? SW_HIDE : SW_SHOW);
-            if (IsWindowVisible(g_hWnd))
-                SetForegroundWindow(g_hWnd);
-        }
+        ShowWindow(g_hWnd, IsWindowVisible(g_hWnd) ? SW_HIDE : SW_SHOW);
+        if (IsWindowVisible(g_hWnd))
+            SetForegroundWindow(g_hWnd);
         return 0;
     }
     return DefWindowProcW(hw, msg, wp, lp);
@@ -1376,12 +1925,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     }
 
     LoadDB();
-    AppLog(L"[INFO] Loaded DB: " + std::to_wstring(g_db.size()) + L" entries");
-
     BYTE test[4] = {};
     if (!CryptoRandomBytes(test, 4))
     {
-        MessageBoxW(NULL, L"BCrypt failed", L"Fatal", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"BCrypt failed.", L"Fatal", MB_OK | MB_ICONERROR);
         return 1;
     }
 
@@ -1390,9 +1937,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         RebuildTrustFromDB();
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // [SECURITY FIX 1] Startup: classify all currently connected HID devices
+    // Unknown devices are now BLOCKED and require CAPTCHA, not auto-trusted
+    // ─────────────────────────────────────────────────────────────────────────
     {
         std::lock_guard<std::mutex> lk(g_devMutex);
-        auto processStartupDev = [&](HANDLE h)
+        auto processStartup = [&](HANDLE h)
         {
             DevRecord r = BuildRecord(h);
             std::wstring dbk = MakeDBKey(r.fullName);
@@ -1401,75 +1952,82 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             {
                 if (it->second.status == DevRecord::Status::Blocked)
                 {
-                    g_blocked.insert(h);
-                    AppLog(L"[STARTUP] Blocked (DB): " + r.friendly);
+                    if (g_rememberBlockedEnabled)
+                    {
+                        g_blocked.insert(h);
+                        AppLog(L"[STARTUP] Blocked (DB): " + r.friendly);
+                    }
+                    else
+                    {
+                        TrustDev(h);
+                        AppLog(L"[STARTUP] Remember-Blocked OFF — trusted: " + r.friendly);
+                    }
                 }
                 else if (it->second.status == DevRecord::Status::Allowed)
                 {
-                    TrustDev(h);
-                    it->second.fullName = r.fullName;
-                    AppLog(L"[STARTUP] Trusted (DB): " + r.friendly);
+                    if (g_allowListingEnabled)
+                    {
+                        TrustDev(h);
+                        it->second.fullName = r.fullName;
+                        AppLog(L"[STARTUP] Trusted (DB): " + r.friendly);
+                    }
+                    else
+                    {
+                        g_blocked.insert(h);
+                        AppLog(L"[STARTUP] Allow-Listing OFF — pending CAPTCHA: " + r.friendly);
+                    }
                 }
                 else
                 {
+                    // Status::Unknown — block it
                     g_blocked.insert(h);
-                    AppLog(L"[STARTUP] Forgotten device blocked — CAPTCHA required: " + r.friendly);
+                    AppLog(L"[STARTUP] Unknown — pending CAPTCHA: " + r.friendly);
                 }
             }
             else
             {
-                TrustDev(h);
-                r.status = DevRecord::Status::Allowed;
+                // [SECURITY FIX 1] NEW DEVICE NOT IN DB — require CAPTCHA
+                g_blocked.insert(h);
+                r.status = DevRecord::Status::Unknown;
                 g_db[dbk] = r;
-                AppLog(L"[STARTUP] Trusted (new): " + r.friendly);
+                AppLog(L"[STARTUP] Unknown device — pending CAPTCHA: " + r.friendly);
             }
         };
         for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
-            processStartupDev(h);
+            processStartup(h);
         for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
-            processStartupDev(h);
-        AppLog(L"[INFO] " + std::to_wstring(g_trusted.size()) + L" trusted, " + std::to_wstring(g_blocked.size()) + L" blocked at startup");
+            processStartup(h);
+        AppLog(L"[INFO] " + std::to_wstring(g_trusted.size()) + L" trusted, " +
+               std::to_wstring(g_blocked.size()) + L" blocked at startup");
     }
     SaveDB();
 
-    {
-        std::vector<std::pair<HANDLE, DevClass>> toChallenge;
-        {
-            std::lock_guard<std::mutex> lk(g_devMutex);
-            for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
-                if (g_blocked.count(h) && !g_pending.count(h) && DBStatus(h) == DevRecord::Status::Unknown)
-                    toChallenge.push_back({h, DevClass::Keyboard});
-            for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
-                if (g_blocked.count(h) && !g_pending.count(h) && DBStatus(h) == DevRecord::Status::Unknown)
-                    toChallenge.push_back({h, DevClass::Mouse});
-        }
-        for (size_t i = 0; i < toChallenge.size(); i++)
-            ShowCaptcha(toChallenge[i].first, toChallenge[i].second);
-    }
-
+    // Main window
     WNDCLASSW wcMain = {};
     wcMain.lpfnWndProc = MainWndProc;
     wcMain.hInstance = hInst;
-    wcMain.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcMain.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wcMain.lpszClassName = L"USBGatekeeperMain";
     wcMain.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wcMain.hIcon = LoadIconW(NULL, IDI_SHIELD);
     RegisterClassW(&wcMain);
-
-    g_hWnd = CreateWindowExW(0, L"USBGatekeeperMain", L"USB Gatekeeper v4.0",
-                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 820, 560, NULL, NULL, hInst, NULL);
+    g_hWnd = CreateWindowExW(0, L"USBGatekeeperMain", L"USB Gatekeeper v4.3",
+                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 960, 680,
+                             NULL, NULL, hInst, NULL);
     ShowWindow(g_hWnd, SW_SHOW);
     UpdateWindow(g_hWnd);
     RefreshDevList();
 
+    // Tray icon window
     WNDCLASSW wcTray = {};
     wcTray.lpfnWndProc = TrayWndProc;
     wcTray.hInstance = hInst;
     wcTray.lpszClassName = L"USBTray";
     RegisterClassW(&wcTray);
-    HWND hTray = CreateWindowExW(0, L"USBTray", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
-    AddTrayIcon(hTray);
+    g_hTrayWnd = CreateWindowExW(0, L"USBTray", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
+    AddTrayIcon(g_hTrayWnd);
 
+    // Background message window (raw input + device change)
     WNDCLASSW wcMsg = {};
     wcMsg.lpfnWndProc = MsgWndProc;
     wcMsg.hInstance = hInst;
@@ -1477,6 +2035,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     RegisterClassW(&wcMsg);
     g_hMsgWnd = CreateWindowExW(0, L"USBGatekeeperMsg", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
 
+    // Register for raw input (keyboard + mouse, background)
     RAWINPUTDEVICE rids[2] = {};
     rids[0].usUsagePage = HID_USAGE_PAGE_GENERIC;
     rids[0].usUsage = HID_USAGE_GENERIC_KEYBOARD;
@@ -1488,6 +2047,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     rids[1].hwndTarget = g_hMsgWnd;
     RegisterRawInputDevices(rids, 2, sizeof(RAWINPUTDEVICE));
 
+    // Device arrival/removal notifications
     DEV_BROADCAST_DEVICEINTERFACE nf = {};
     nf.dbcc_size = sizeof(nf);
     nf.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
@@ -1495,7 +2055,31 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     g_hDevNotify = RegisterDeviceNotificationW(g_hMsgWnd, &nf, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKBProc, hInst, 0);
-    AppLog(L"[INFO] USB Gatekeeper active");
+
+    AppLog(L"[INFO] USB Gatekeeper v4.3 active");
+    AppLog(L"[INFO] Allow-Listing: " + std::wstring(g_allowListingEnabled ? L"ON" : L"OFF"));
+    AppLog(L"[INFO] Remember-Blocked: " + std::wstring(g_rememberBlockedEnabled ? L"ON" : L"OFF"));
+    if (CAPTCHA_TIMEOUT_MS > 0)
+        AppLog(L"[INFO] CAPTCHA auto-deny timeout: " + std::to_wstring(CAPTCHA_TIMEOUT_MS / 1000) + L"s");
+    AppLog(L"[INFO] TIP: 'Forget Device' before replug to trigger a fresh CAPTCHA");
+    AppLog(L"[SECURITY] Unknown devices at startup require CAPTCHA");
+    AppLog(L"[SECURITY] Denied CAPTCHAs require CAPTCHA on replug (not saved as blocked)");
+
+    // Show CAPTCHA for any devices that were unknown at startup
+    {
+        std::vector<std::pair<HANDLE, DevClass>> toChallenge;
+        {
+            std::lock_guard<std::mutex> lk(g_devMutex);
+            for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
+                if (g_blocked.count(h) && !g_pending.count(h) && DBStatus(h) == DevRecord::Status::Unknown)
+                    toChallenge.push_back({h, DevClass::Keyboard});
+            for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
+                if (g_blocked.count(h) && !g_pending.count(h) && DBStatus(h) == DevRecord::Status::Unknown)
+                    toChallenge.push_back({h, DevClass::Mouse});
+        }
+        for (auto &p : toChallenge)
+            ShowCaptcha(p.first, p.second);
+    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
