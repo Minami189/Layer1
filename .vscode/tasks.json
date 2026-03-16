@@ -17,6 +17,8 @@
                 "-lhid",
                 "-lsetupapi",
                 "-lbcrypt",
+                "-lcomctl32",
+                "-lshell32",
                 "-mwindows"
             ],
             "options": {
