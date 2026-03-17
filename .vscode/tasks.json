@@ -2,42 +2,95 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build USB Gatekeeper",
+            "label": "C/C++: g++.exe build active file",
             "type": "shell",
-            "command": "C:\\msys64\\ucrt64\\bin\\g++.exe",
+            "command": "C:/msys64/mingw64/bin/g++.exe",
             "args": [
+                "-fdiagnostics-color=always",
                 "-std=c++17",
-                "-o", "usb_gatekeeper.exe",
-                "usb_gatekeeper.cpp",
-                "app_manifest.o",
-                "-luser32", "-lgdi32", "-lhid",
-                "-lsetupapi", "-lbcrypt", "-lcomctl32",
-                "-mwindows"
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}.exe",
+                "-luser32",
+                "-lgdi32",
+                "-lsetupapi",
+                "-lbcrypt",
+                "-lcomctl32",
+                "-lshell32",
+                "-mwindows",
+                "-lhid"
             ],
             "options": {
-                "shell": {
-                    "executable": "cmd.exe",
-                    "args": ["/d", "/c"]
-                }
+                "cwd": "${fileDirname}"
             },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": "build"
+        },
+        {
+            "type": "cppbuild",
+            "label": "C/C++: g++.exe build active file",
+            "command": "C:\\msys64\\mingw64\\bin\\g++.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}\\${fileBasenameNoExtension}.exe"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": "build",
+            "detail": "compiler: C:\\msys64\\mingw64\\bin\\g++.exe"
+        },
+        {
+            "type": "cppbuild",
+            "label": "C/C++: g++.exe build active file",
+            "command": "C:\\msys64\\mingw64\\bin\\g++.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}\\${fileBasenameNoExtension}.exe"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": "build",
+            "detail": "compiler: C:\\msys64\\mingw64\\bin\\g++.exe"
+        },
+        {
+            "type": "cppbuild",
+            "label": "C/C++: g++.exe build active file",
+            "command": "C:\\msys64\\mingw64\\bin\\g++.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}\\${fileBasenameNoExtension}.exe"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": ["$gcc"]
-        },
-        {
-            "label": "Run USB Gatekeeper",
-            "type": "shell",
-            "command": "Start-Process -FilePath .\\usb_gatekeeper.exe -Verb RunAs",
-            "options": {
-                "shell": {
-                    "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-                    "args": ["-Command"]
-                }
-            },
-            "dependsOn": "Build USB Gatekeeper",
-            "problemMatcher": []
+            "detail": "compiler: C:\\msys64\\mingw64\\bin\\g++.exe"
         }
     ]
 }

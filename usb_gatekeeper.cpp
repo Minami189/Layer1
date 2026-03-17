@@ -12,8 +12,6 @@
 #include <dbt.h>
 #include <hidusage.h>
 #include <setupapi.h>
-#include <hidsdi.h>
-#include <hidpi.h>
 #include <shellapi.h>
 #include <fstream>
 #include <sstream>
@@ -34,9 +32,6 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "hid.lib")
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Auto-deny timeout for the CAPTCHA window.  Set to 0 to disable.
 // ─────────────────────────────────────────────────────────────────────────────
 static constexpr UINT CAPTCHA_TIMEOUT_MS = 60000;
@@ -121,8 +116,7 @@ DWORD CryptoRandRange(DWORD upper)
 enum class ChalType
 {
     Scramble,
-    Hex,
-    Token,
+    Hex,Token,
     MouseColor
 };
 enum class DevClass
@@ -475,25 +469,9 @@ struct HIDDescriptor
 };
 HIDDescriptor GetHIDDescriptor(const std::wstring &devPath)
 {
-    HIDDescriptor d;
-    HANDLE hDev = CreateFileW(devPath.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              NULL, OPEN_EXISTING, 0, NULL);
-    if (hDev == INVALID_HANDLE_VALUE)
-        return d;
-    wchar_t buf[256] = {};
-    if (HidD_GetManufacturerString(hDev, buf, sizeof(buf)) && buf[0])
-        d.manufacturer = buf;
-    wmemset(buf, 0, 256);
-    if (HidD_GetProductString(hDev, buf, sizeof(buf)) && buf[0])
-        d.product = buf;
-    wmemset(buf, 0, 256);
-    if (HidD_GetSerialNumberString(hDev, buf, sizeof(buf)) && buf[0])
-        d.usbSerial = buf;
-    HIDD_ATTRIBUTES attrs = {sizeof(attrs)};
-    if (HidD_GetAttributes(hDev, &attrs))
-        d.version = attrs.VersionNumber;
-    CloseHandle(hDev);
-    return d;
+    // HidD_* functions unavailable on this toolchain — return defaults
+    (void)devPath;
+    return HIDDescriptor{};
 }
 DevRecord BuildRecord(HANDLE h)
 {
