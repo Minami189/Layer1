@@ -19,7 +19,7 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
-#include <deque>
+#include <deque> // [FIX 2]
 #include <set>
 #include <map>
 #include <string>
@@ -37,7 +37,7 @@
 #pragma comment(lib, "hid.lib")
 
 // ─────────────────────────────────────────────────────────────────────────────
-// [SUGGEST A] Auto-deny timeout for the CAPTCHA window.  Set to 0 to disable.
+// Auto-deny timeout for the CAPTCHA window.  Set to 0 to disable.
 // ─────────────────────────────────────────────────────────────────────────────
 static constexpr UINT CAPTCHA_TIMEOUT_MS = 60000;
 #define CAPTCHA_TIMER_ID 42
@@ -288,7 +288,7 @@ static bool g_rememberBlockedEnabled = true;
 std::map<std::wstring, DevRecord> g_db;
 std::set<HANDLE> g_trusted;
 std::set<std::wstring> g_trustedNames;
-std::set<std::wstring> g_trustedVIDPIDs; // "VID_xxxx&PID_xxxx"
+// Removed g_trustedVIDPIDs - using instance-specific trust only
 std::set<HANDLE> g_blocked;
 std::set<HANDLE> g_pending;
 std::mutex g_devMutex;
@@ -313,7 +313,7 @@ HWND g_hCaptcha = NULL;
 HWND g_hLog = NULL;
 HWND g_hDevList = NULL;
 HDEVNOTIFY g_hDevNotify = NULL;
-HWND g_hTrayWnd = NULL; // [SUGGEST B]
+HWND g_hTrayWnd = NULL;
 
 static HWND g_hStaticLog = NULL;
 static HWND g_hStaticDev = NULL;
@@ -610,13 +610,21 @@ void AppLog(const std::wstring &msg)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Device list
+// Device list - shows real-time connection status
 // ─────────────────────────────────────────────────────────────────────────────
 void RefreshDevList()
 {
     if (!g_hDevList)
         return;
     SendMessageW(g_hDevList, LVM_DELETEALLITEMS, 0, 0);
+
+    // Get all currently connected devices
+    std::set<std::wstring> connectedNames;
+    for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
+        connectedNames.insert(GetDevName(h));
+    for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
+        connectedNames.insert(GetDevName(h));
+
     int row = 0;
     std::lock_guard<std::mutex> lk(g_devMutex);
     for (auto &kv : g_db)
@@ -624,11 +632,15 @@ void RefreshDevList()
         auto &r = kv.second;
         const wchar_t *stStr = (r.status == DevRecord::Status::Allowed) ? L"ALLOWED" : (r.status == DevRecord::Status::Blocked) ? L"BLOCKED"
                                                                                                                                 : L"unknown";
+        // Check if device is currently connected
+        bool connected = connectedNames.count(r.fullName) > 0;
+        const wchar_t *connStr = connected ? L"YES" : L"NO";
+
         LVITEMW lvi = {};
         lvi.mask = LVIF_TEXT;
         lvi.iItem = row;
         lvi.iSubItem = 0;
-        lvi.pszText = (LPWSTR)stStr;
+        lvi.pszText = (LPWSTR)connStr; // First column: Connected status
         SendMessageW(g_hDevList, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
         auto setCol = [&](int col, const std::wstring &text)
         {
@@ -636,30 +648,29 @@ void RefreshDevList()
             lvi.pszText = (LPWSTR)text.c_str();
             SendMessageW(g_hDevList, LVM_SETITEMW, 0, (LPARAM)&lvi);
         };
-        setCol(1, r.manufacturer);
-        setCol(2, r.product);
-        setCol(3, r.usbSerial);
-        setCol(4, r.vid);
-        setCol(5, r.pid);
-        setCol(6, r.instanceId);
+        setCol(1, stStr);
+        setCol(2, r.manufacturer);
+        setCol(3, r.product);
+        setCol(4, r.usbSerial);
+        setCol(5, r.vid);
+        setCol(6, r.pid);
+        setCol(7, r.instanceId);
         row++;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Trust helpers
+// Trust helpers - INSTANCE-SPECIFIC trust only
 // ─────────────────────────────────────────────────────────────────────────────
 void RebuildTrustFromDB()
 {
     g_trustedNames.clear();
-    g_trustedVIDPIDs.clear();
+    // Removed g_trustedVIDPIDs - we only trust specific instances, not all devices with same VID+PID
     for (auto &kv : g_db)
     {
         if (kv.second.status == DevRecord::Status::Allowed)
         {
             g_trustedNames.insert(kv.second.fullName);
-            if (!kv.second.vid.empty() && !kv.second.pid.empty())
-                g_trustedVIDPIDs.insert(L"VID_" + kv.second.vid + L"&PID_" + kv.second.pid);
         }
     }
 }
@@ -669,10 +680,7 @@ DevRecord::Status DBStatus(HANDLE h)
     auto it = g_db.find(MakeDBKey(n));
     if (it != g_db.end())
         return it->second.status;
-    std::wstring vid = GetVID(n), pid = GetPID(n);
-    for (auto &kv : g_db)
-        if (kv.second.vid == vid && kv.second.pid == pid)
-            return kv.second.status;
+    // Removed VID+PID fallback - instance-specific only
     return DevRecord::Status::Unknown;
 }
 bool IsTrusted(HANDLE h)
@@ -682,22 +690,28 @@ bool IsTrusted(HANDLE h)
     std::wstring n = GetDevName(h);
     if (g_trustedNames.count(n))
         return true;
-    std::wstring vid = GetVID(n), pid = GetPID(n);
-    if (!vid.empty() && !pid.empty())
-        return g_trustedVIDPIDs.count(L"VID_" + vid + L"&PID_" + pid) > 0;
+    // Removed VID+PID check - instance-specific trust only
     return false;
 }
 void TrustDev(HANDLE h)
 {
-    std::wstring n = GetDevName(h), vid = GetVID(n), pid = GetPID(n);
+    std::wstring n = GetDevName(h);
     g_trusted.insert(h);
     g_trustedNames.insert(n);
-    if (!vid.empty() && !pid.empty())
-        g_trustedVIDPIDs.insert(L"VID_" + vid + L"&PID_" + pid);
+    // Removed VID+PID insertion - instance-specific trust only
+}
+
+// Trust only THIS SPECIFIC INSTANCE (for CAPTCHA pass - session-only trust)
+void TrustDevInstanceOnly(HANDLE h)
+{
+    std::wstring n = GetDevName(h);
+    g_trusted.insert(h);      // Trust this handle only
+    g_trustedNames.insert(n); // Trust this specific instance path only
+    // Do NOT add to g_trustedVIDPIDs - other instances still need CAPTCHA
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// [SUGGEST B] Tray tooltip — shows queue depth when non-empty
+// Tray tooltip — shows queue depth when non-empty
 // ─────────────────────────────────────────────────────────────────────────────
 void UpdateTrayTooltip()
 {
@@ -798,15 +812,29 @@ void ProcessCaptchaQueue()
 //       The captcha thread sets it to false and posts WM_NEXT_CAPTCHA just
 //       before it exits, so the queue always advances correctly.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// [SESSION-ONLY TRUST] ApproveDevice — CAPTCHA pass grants session-only trust
+//
+// Passing the CAPTCHA only trusts the device for THIS SESSION. The device
+// remains Status::Unknown in the database and will require CAPTCHA on next replug.
+// Use the "Allow Selected" button in the GUI for permanent allow-listing.
+// ─────────────────────────────────────────────────────────────────────────────
 void ApproveDevice(HANDLE dev)
 {
     {
         std::lock_guard<std::mutex> lk(g_devMutex);
-        TrustDev(dev);
+        TrustDev(dev); // Add to session trust (g_trusted, g_trustedNames, g_trustedVIDPIDs)
+
+        // Ensure device record exists in DB, but keep status as Unknown
         DevRecord r = BuildRecord(dev);
-        r.status = DevRecord::Status::Allowed;
-        g_db[MakeDBKey(r.fullName)] = r;
-        RebuildTrustFromDB();
+        std::wstring dbk = MakeDBKey(r.fullName);
+        if (!g_db.count(dbk))
+        {
+            r.status = DevRecord::Status::Unknown; // NOT Allowed!
+            g_db[dbk] = r;
+        }
+        // If it already exists, don't change its status
+
         g_trusted.insert(dev);
         for (auto it = g_blocked.begin(); it != g_blocked.end();)
             it = IsTrusted(*it) ? g_blocked.erase(it) : ++it;
@@ -815,8 +843,8 @@ void ApproveDevice(HANDLE dev)
         for (int i = 0; i < 4; i++)
             g_rawRing[i] = NULL;
     }
-    SaveDB();
-    AppLog(L"[APPROVED] " + ShortName(dev));
+    // Don't call SaveDB() - we're not changing persistent state
+    AppLog(L"[APPROVED] " + ShortName(dev) + L" (session only — use 'Allow Selected' for permanent)");
     g_chalDev = NULL;
     g_hCaptcha = NULL;
     RefreshDevList();
@@ -855,7 +883,7 @@ void DenyDevice(HANDLE dev)
 // ─────────────────────────────────────────────────────────────────────────────
 void ManualAllow(const std::wstring &dbKey)
 {
-    std::wstring friendly, vid, pid;
+    std::wstring friendly, fullName;
     {
         std::lock_guard<std::mutex> lk(g_devMutex);
         auto it = g_db.find(dbKey);
@@ -863,35 +891,33 @@ void ManualAllow(const std::wstring &dbKey)
             return;
         it->second.status = DevRecord::Status::Allowed;
         friendly = it->second.friendly;
-        vid = it->second.vid;
-        pid = it->second.pid;
+        fullName = it->second.fullName;
         RebuildTrustFromDB();
+
+        // Clear from blocked/pending if currently connected
         auto clearSets = [&](std::set<HANDLE> &s)
         {
             for (auto it2 = s.begin(); it2 != s.end();)
-                it2 = (!vid.empty() && GetVID(GetDevName(*it2)) == vid && GetPID(GetDevName(*it2)) == pid)
-                          ? s.erase(it2)
-                          : ++it2;
+            {
+                if (GetDevName(*it2) == fullName)
+                    it2 = s.erase(it2);
+                else
+                    ++it2;
+            }
         };
         clearSets(g_blocked);
         clearSets(g_pending);
         for (int i = 0; i < 4; i++)
             g_rawRing[i] = NULL;
 
-        // Close captcha if it's showing for this device
-        if (g_chalDev)
+        // Close captcha if it's showing for this exact device
+        if (g_chalDev && GetDevName(g_chalDev) == fullName)
         {
-            std::wstring cn = GetDevName(g_chalDev);
-            if (!vid.empty() && GetVID(cn) == vid && GetPID(cn) == pid)
+            g_chalDev = NULL;
+            if (g_hCaptcha)
             {
-                g_chalDev = NULL; // clear before posting so DenyDevice gets NULL → no-op
-                if (g_hCaptcha)
-                {
-                    PostMessageW(g_hCaptcha, WM_DISMISS_CAPTCHA, 0, 0);
-                    g_hCaptcha = NULL;
-                }
-                // g_captchaActive is cleared by the captcha thread on exit;
-                // WM_NEXT_CAPTCHA will drive the queue forward automatically.
+                PostMessageW(g_hCaptcha, WM_DISMISS_CAPTCHA, 0, 0);
+                g_hCaptcha = NULL;
             }
         }
     }
@@ -902,7 +928,7 @@ void ManualAllow(const std::wstring &dbKey)
 
 void ManualBlock(const std::wstring &dbKey)
 {
-    std::wstring friendly, vid, pid;
+    std::wstring friendly, fullName;
     {
         std::lock_guard<std::mutex> lk(g_devMutex);
         auto it = g_db.find(dbKey);
@@ -910,15 +936,16 @@ void ManualBlock(const std::wstring &dbKey)
             return;
         it->second.status = DevRecord::Status::Blocked;
         friendly = it->second.friendly;
-        vid = it->second.vid;
-        pid = it->second.pid;
+        fullName = it->second.fullName;
         RebuildTrustFromDB();
+
+        // Process currently connected devices with this exact instance
         auto processHandles = [&](const std::set<HANDLE> &handles)
         {
             for (HANDLE h : handles)
             {
                 std::wstring dn = GetDevName(h);
-                if (!vid.empty() && GetVID(dn) == vid && GetPID(dn) == pid)
+                if (dn == fullName)
                 {
                     g_trusted.erase(h);
                     g_trustedNames.erase(dn);
@@ -936,52 +963,51 @@ void ManualBlock(const std::wstring &dbKey)
 
 void ManualForget(const std::wstring &dbKey)
 {
-    std::wstring friendly, vid, pid;
+    std::wstring friendly, fullName;
     {
         std::lock_guard<std::mutex> lk(g_devMutex);
         auto it = g_db.find(dbKey);
         if (it == g_db.end())
             return;
         friendly = it->second.friendly;
-        vid = it->second.vid;
-        pid = it->second.pid;
+        fullName = it->second.fullName;
         it->second.status = DevRecord::Status::Unknown;
         RebuildTrustFromDB();
+
         auto removeHandles = [&](std::set<HANDLE> &s)
         {
             for (auto hit = s.begin(); hit != s.end();)
-                hit = (!vid.empty() && GetVID(GetDevName(*hit)) == vid && GetPID(GetDevName(*hit)) == pid)
-                          ? s.erase(hit)
-                          : ++hit;
+            {
+                if (GetDevName(*hit) == fullName)
+                    hit = s.erase(hit);
+                else
+                    ++hit;
+            }
         };
         removeHandles(g_trusted);
         removeHandles(g_pending);
+
+        // Block the device if currently connected
         for (HANDLE h : EnumByType(RIM_TYPEKEYBOARD))
         {
-            std::wstring dn = GetDevName(h);
-            if (!vid.empty() && GetVID(dn) == vid && GetPID(dn) == pid)
+            if (GetDevName(h) == fullName)
                 g_blocked.insert(h);
         }
         for (HANDLE h : EnumByType(RIM_TYPEMOUSE))
         {
-            std::wstring dn = GetDevName(h);
-            if (!vid.empty() && GetVID(dn) == vid && GetPID(dn) == pid)
+            if (GetDevName(h) == fullName)
                 g_blocked.insert(h);
         }
         for (int i = 0; i < 4; i++)
             g_rawRing[i] = NULL;
 
-        if (g_chalDev)
+        if (g_chalDev && GetDevName(g_chalDev) == fullName)
         {
-            std::wstring cn = GetDevName(g_chalDev);
-            if (!vid.empty() && GetVID(cn) == vid && GetPID(cn) == pid)
+            g_chalDev = NULL;
+            if (g_hCaptcha)
             {
-                g_chalDev = NULL;
-                if (g_hCaptcha)
-                {
-                    PostMessageW(g_hCaptcha, WM_DISMISS_CAPTCHA, 0, 0);
-                    g_hCaptcha = NULL;
-                }
+                PostMessageW(g_hCaptcha, WM_DISMISS_CAPTCHA, 0, 0);
+                g_hCaptcha = NULL;
             }
         }
     }
@@ -1029,7 +1055,7 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             }
     };
 
-    // [SUGGEST A] helper to (re)start the inactivity timer
+    // helper to (re)start the inactivity timer
     auto ResetTimer = [&]()
     {
         if (CAPTCHA_TIMEOUT_MS > 0)
@@ -1104,11 +1130,11 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         }
         g_wrong = 0;
         g_timing.Reset();
-        ResetTimer(); // [SUGGEST A] start inactivity timer
+        ResetTimer(); // start inactivity timer
         return 0;
     }
 
-    // [SUGGEST A] Inactivity timeout → auto-deny
+    // Inactivity timeout → auto-deny
     case WM_TIMER:
         if (wp == CAPTCHA_TIMER_ID)
         {
@@ -1154,7 +1180,7 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 SetDlgItemTextW(hw, IDC_LABEL, g_chal.display.c_str());
                 SetDlgItemTextW(hw, IDC_INPUT, L"");
                 SetFocus(GetDlgItem(hw, IDC_INPUT));
-                ResetTimer(); // [SUGGEST A]
+                ResetTimer();
                 return 0;
             }
             if (WEqCI(input, g_chal.answer))
@@ -1182,7 +1208,7 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 SetDlgItemTextW(hw, IDC_LABEL, g_chal.display.c_str());
                 SetDlgItemTextW(hw, IDC_INPUT, L"");
                 SetFocus(GetDlgItem(hw, IDC_INPUT));
-                ResetTimer(); // [SUGGEST A]
+                ResetTimer();
             }
             return 0;
         }
@@ -1216,7 +1242,7 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                     hBox[i] = CreateSolidBrush(CVALS[ci]);
                     InvalidateRect(g_mouseBoxHwnd[i], NULL, TRUE);
                 }
-                ResetTimer(); // [SUGGEST A]
+                ResetTimer();
             }
             return 0;
         }
@@ -1236,7 +1262,7 @@ LRESULT CALLBACK CaptchaProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     case WM_KEYDOWN:
         if ((HWND)GetFocus() == GetDlgItem(hw, IDC_INPUT))
             g_timing.Add((double)GetTickCount64());
-        ResetTimer(); // [SUGGEST A] any keystroke resets the timeout
+        ResetTimer(); // any keystroke resets the timeout
         return DefWindowProcW(hw, msg, wp, lp);
 
     case WM_CTLCOLORBTN:
@@ -1414,7 +1440,7 @@ LRESULT CALLBACK LowLevelKBProc(int nCode, WPARAM wp, LPARAM lp)
 // ─────────────────────────────────────────────────────────────────────────────
 static void LayoutMainWindow(int W, int H)
 {
-    const int PAD = 8, LABEL_H = 16, BTN_H = 28, BTN_W = 130, CHK_H = 20, CHK_W = 200;
+    const int PAD = 8, LABEL_H = 16, BTN_H = 28, BTN_W = 130, CHK_H = 20, CHK_W = 280;
     int y = PAD;
     if (g_hStaticLog)
         SetWindowPos(g_hStaticLog, NULL, PAD, y, W - PAD * 2, LABEL_H, SWP_NOZORDER);
@@ -1490,13 +1516,13 @@ LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageW(g_hLog, WM_SETFONT, (WPARAM)hF, TRUE);
 
         g_hStaticSettings = mkStatic(L"Settings", (HMENU)IDC_STATIC_SETTINGS);
-        g_hChkAllowList = mkChk(L"Allow-Listing (skip CAPTCHA for trusted devices)", (HMENU)IDC_CHK_ALLOWLIST);
-        g_hChkRemBlocked = mkChk(L"Remember-Blocked (persist blocked devices)", (HMENU)IDC_CHK_REMBLOCKED);
+        g_hChkAllowList = mkChk(L"Allow-list trusted devices (skip CAPTCHA)", (HMENU)IDC_CHK_ALLOWLIST);
+        g_hChkRemBlocked = mkChk(L"Remember blocked devices", (HMENU)IDC_CHK_REMBLOCKED);
         SendMessageW(g_hChkAllowList, BM_SETCHECK, g_allowListingEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(g_hChkRemBlocked, BM_SETCHECK, g_rememberBlockedEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
 
         g_hStaticDev = mkStatic(
-            L"Known Devices  (Status / Manufacturer / Product / USB Serial / VID / PID / Instance)",
+            L"Known Devices  (Connected / Status / Manufacturer / Product / USB Serial / VID / PID / Instance)",
             (HMENU)IDC_STATIC_DEV);
         g_hDevList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, NULL,
                                      WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -1508,8 +1534,8 @@ LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             const wchar_t *name;
             int cx;
         } cols[] = {
-            {L"Status", 80}, {L"Manufacturer", 130}, {L"Product", 160}, {L"USB Serial", 110}, {L"VID", 60}, {L"PID", 60}, {L"Instance", 140}};
-        for (int i = 0; i < 7; i++)
+            {L"Connected", 80}, {L"Status", 80}, {L"Manufacturer", 130}, {L"Product", 160}, {L"USB Serial", 110}, {L"VID", 60}, {L"PID", 60}, {L"Instance", 140}};
+        for (int i = 0; i < 8; i++)
         {
             LVCOLUMNW col = {};
             col.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -1711,55 +1737,16 @@ LRESULT CALLBACK MainWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
-    case WM_CLOSE:
-        ShowWindow(hw, SW_HIDE);
-        return 0;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcW(hw, msg, wp, lp);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Background message window — WM_INPUT + WM_DEVICECHANGE
-// ─────────────────────────────────────────────────────────────────────────────
-LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
-{
-    switch (uMsg)
-    {
-    // [FIX 2] Drive the CAPTCHA queue after each captcha thread exits.
-    case WM_NEXT_CAPTCHA:
-        ProcessCaptchaQueue();
-        return 0;
-
-    case WM_INPUT:
-    {
-        UINT sz = 0;
-        GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &sz, sizeof(RAWINPUTHEADER));
-        std::vector<BYTE> buf(sz);
-        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, buf.data(), &sz, sizeof(RAWINPUTHEADER)) == sz)
-        {
-            auto *raw = reinterpret_cast<RAWINPUT *>(buf.data());
-            if (raw->header.dwType == RIM_TYPEKEYBOARD)
-            {
-                g_rawRing[g_rawRingIdx & 3] = raw->header.hDevice;
-                g_rawRingIdx++;
-            }
-        }
-        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
-    }
-
     case WM_DEVICECHANGE:
     {
-        if (wParam == DBT_DEVICEARRIVAL)
+        if (wp == DBT_DEVICEARRIVAL)
         {
-            auto *hdr = reinterpret_cast<DEV_BROADCAST_HDR *>(lParam);
+            auto *hdr = reinterpret_cast<DEV_BROADCAST_HDR *>(lp);
             if (!hdr || hdr->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
                 break;
 
             // [FIX 1] Extract the identity of the device that just arrived.
-            auto *devIface = reinterpret_cast<DEV_BROADCAST_DEVICEINTERFACE *>(lParam);
+            auto *devIface = reinterpret_cast<DEV_BROADCAST_DEVICEINTERFACE *>(lp);
             DevKey arrivedKey = ExtractDevKey(devIface->dbcc_name);
 
             Sleep(400); // let Windows finish registering the device
@@ -1832,7 +1819,7 @@ LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             if (needCaptcha)
                 ShowCaptcha(newDev, dc);
         }
-        else if (wParam == DBT_DEVICEREMOVECOMPLETE)
+        else if (wp == DBT_DEVICEREMOVECOMPLETE)
         {
             auto kbs = EnumByType(RIM_TYPEKEYBOARD);
             auto mice = EnumByType(RIM_TYPEMOUSE);
@@ -1869,9 +1856,50 @@ LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                                    { return !all.count(item.dev); }),
                     g_captchaQueue.end());
             }
+
+            RefreshDevList(); // Update device list to show disconnected status
         }
         return TRUE;
     }
+    case WM_CLOSE:
+        ShowWindow(hw, SW_HIDE);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hw, msg, wp, lp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Background message window — WM_INPUT + WM_DEVICECHANGE
+// ─────────────────────────────────────────────────────────────────────────────
+LRESULT CALLBACK MsgWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg)
+    {
+    // [FIX 2] Drive the CAPTCHA queue after each captcha thread exits.
+    case WM_NEXT_CAPTCHA:
+        ProcessCaptchaQueue();
+        return 0;
+
+    case WM_INPUT:
+    {
+        UINT sz = 0;
+        GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &sz, sizeof(RAWINPUTHEADER));
+        std::vector<BYTE> buf(sz);
+        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, buf.data(), &sz, sizeof(RAWINPUTHEADER)) == sz)
+        {
+            auto *raw = reinterpret_cast<RAWINPUT *>(buf.data());
+            if (raw->header.dwType == RIM_TYPEKEYBOARD)
+            {
+                g_rawRing[g_rawRingIdx & 3] = raw->header.hDevice;
+                g_rawRingIdx++;
+            }
+        }
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -2047,12 +2075,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     rids[1].hwndTarget = g_hMsgWnd;
     RegisterRawInputDevices(rids, 2, sizeof(RAWINPUTDEVICE));
 
-    // Device arrival/removal notifications
+    // Device arrival/removal notifications - register on MAIN WINDOW for reliable detection
+    // (message-only windows don't always receive device notifications reliably)
     DEV_BROADCAST_DEVICEINTERFACE nf = {};
     nf.dbcc_size = sizeof(nf);
     nf.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     nf.dbcc_classguid = {0x4D1E55B2, 0xF16F, 0x11CF, {0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}};
-    g_hDevNotify = RegisterDeviceNotificationW(g_hMsgWnd, &nf, DEVICE_NOTIFY_WINDOW_HANDLE);
+    g_hDevNotify = RegisterDeviceNotificationW(g_hWnd, &nf, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKBProc, hInst, 0);
 
@@ -2064,6 +2093,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     AppLog(L"[INFO] TIP: 'Forget Device' before replug to trigger a fresh CAPTCHA");
     AppLog(L"[SECURITY] Unknown devices at startup require CAPTCHA");
     AppLog(L"[SECURITY] Denied CAPTCHAs require CAPTCHA on replug (not saved as blocked)");
+    AppLog(L"[TWO-TIER TRUST] Pass CAPTCHA = session-only | 'Allow Selected' = permanent");
+    AppLog(L"[INSTANCE-SPECIFIC] Each USB port tracked separately - one allow ≠ all ports");
 
     // Show CAPTCHA for any devices that were unknown at startup
     {

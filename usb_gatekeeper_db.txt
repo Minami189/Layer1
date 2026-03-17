@@ -1,6 +1,6 @@
 A|||<none>|<unknown>|<unknown>|<none>|0|\\?\Microsoft Keyboard RID\0
 A|3554|F58E|8&150037ef&0&0000|Compx|VXE Mouse 1K Dongle|<none>|272|\\?\HID#VID_3554&PID_F58E&MI_02#8&150037ef&0&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}
 A|3554|F58E|8&2113e96c&0&0000|Compx|VXE Mouse 1K Dongle|<none>|272|\\?\HID#VID_3554&PID_F58E&MI_00#8&2113e96c&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
-A|373B|105C|8&2acff09&0&0000|Shenzhen Yizhita Technology Co., Ltd|MAD68|MAD HE|1|\\?\HID#VID_373B&PID_105C&MI_02&Col01#8&2acff09&0&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}
-A|373B|105C|8&2acff09&0&0003|Shenzhen Yizhita Technology Co., Ltd|MAD68|MAD HE|1|\\?\HID#VID_373B&PID_105C&MI_02&Col04#8&2acff09&0&0003#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
+U|373B|105C|8&2acff09&0&0000|Shenzhen Yizhita Technology Co., Ltd|MAD68|MAD HE|1|\\?\HID#VID_373B&PID_105C&MI_02&Col01#8&2acff09&0&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}
+U|373B|105C|8&2acff09&0&0003|Shenzhen Yizhita Technology Co., Ltd|MAD68|MAD HE|1|\\?\HID#VID_373B&PID_105C&MI_02&Col04#8&2acff09&0&0003#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
 A|373B|105C|8&2d4275e&0&0000|Shenzhen Yizhita Technology Co., Ltd|MAD68|MAD HE|1|\\?\HID#VID_373B&PID_105C&MI_00#8&2d4275e&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}
